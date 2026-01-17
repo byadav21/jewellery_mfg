@@ -1,0 +1,76 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: jewellery_mongodb
+    restart: always
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: RootPass123!
+      MONGO_INITDB_DATABASE: myappdb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - ./mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+    networks:
+      - jewellery_network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: jewellery_backend
+    restart: always
+    environment:
+      NODE_ENV: development
+      PORT: 5000
+      MONGODB_URI: mongodb://appuser:AppUserPass456!@mongodb:27017/myappdb?authSource=myappdb
+      JWT_SECRET: jewellery_manufacturing_secret_key_2024
+      JWT_EXPIRE: 7d
+      # CSP Amazon Account credentials
+      CSP_AMAZON_REFRESH_TOKEN: ${CSP_AMAZON_REFRESH_TOKEN}
+      CSP_AMAZON_CLIENT_ID: ${CSP_AMAZON_CLIENT_ID}
+      CSP_AMAZON_CLIENT_SECRET: ${CSP_AMAZON_CLIENT_SECRET}
+      CSP_AMAZON_MARKETPLACE_ID: ${CSP_AMAZON_MARKETPLACE_ID:-ATVPDKIKX0DER}
+      # Legacy Amazon credentials (backward compatibility)
+      AMAZON_REFRESH_TOKEN: ${AMAZON_REFRESH_TOKEN}
+      AMAZON_CLIENT_ID: ${AMAZON_CLIENT_ID}
+      AMAZON_CLIENT_SECRET: ${AMAZON_CLIENT_SECRET}
+    ports:
+      - "5001:5000"
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+      - uploads_data:/app/uploads
+    depends_on:
+      - mongodb
+    networks:
+      - jewellery_network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: jewellery_frontend
+    restart: always
+    environment:
+      REACT_APP_API_URL: http://localhost:5001/api
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    networks:
+      - jewellery_network
+
+volumes:
+  mongodb_data:
+  uploads_data:
+
+networks:
+  jewellery_network:
+    driver: bridge

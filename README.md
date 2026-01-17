@@ -6,7 +6,7 @@ A comprehensive web-based system for managing the entire jewellery manufacturing
 
 - **Amazon & eBay Integration** - Automatic order fetching via SP-API and eBay Sell API
 - **CAD Workflow** - Assignment, upload, version control, and review process
-- **Component Management** - Track gold, diamonds, gemstones, and other materials
+- **SKU Master** - Manage product SKUs and marketplace mappings
 - **Manufacturing Tracking** - Job assignment and status updates
 - **Delivery Management** - Hand delivery and courier tracking
 - **WhatsApp & Email Notifications** - Automated alerts at every stage
@@ -49,19 +49,46 @@ A comprehensive web-based system for managing the entire jewellery manufacturing
 │   │   └── index.js         # Entry point
 │   └── package.json
 │
-├── TEST_CASES.md            # Test cases document
+├── docker-compose.yml       # Docker orchestration
+├── mongo-init.js            # MongoDB initialization
 └── README.md
 ```
 
 ## Setup Instructions
 
-### Prerequisites
+### Option 1: Using Docker (Recommended)
+
+1. Clone the repository:
+   ```bash
+   git clone <your-repo-url>
+   cd sap_data_p
+   ```
+
+2. Create environment files:
+   ```bash
+   cp backend/.env.example backend/.env
+   cp frontend/.env.example frontend/.env
+   # Edit the .env files with your configuration
+   ```
+
+3. Start all services:
+   ```bash
+   docker-compose up -d
+   ```
+
+4. Access the application:
+   - Frontend: http://localhost:3000
+   - Backend API: http://localhost:5001
+
+### Option 2: Local Development
+
+#### Prerequisites
 
 - Node.js v18+
 - MongoDB (local or Atlas)
 - npm or yarn
 
-### Backend Setup
+#### Backend Setup
 
 1. Navigate to backend folder:
    ```bash
@@ -143,11 +170,6 @@ A comprehensive web-based system for managing the entire jewellery manufacturing
 - `POST /api/cad/:jobId/approve` - Approve CAD
 - `POST /api/cad/:jobId/reject` - Reject CAD
 
-### Components
-- `GET /api/components` - List components
-- `POST /api/components` - Create component
-- `POST /api/components/job/:jobId/issue` - Issue to job
-
 ### Manufacturing
 - `GET /api/manufacturing/my-jobs` - My jobs
 - `POST /api/manufacturing/:jobId/assign` - Assign manufacturer
@@ -194,11 +216,10 @@ The system runs automatic background jobs:
 3. **CAD Assignment** → Admin assigns to designer
 4. **CAD Upload** → Designer uploads STL/renders
 5. **CAD Review** → Admin approves or rejects
-6. **Component Issue** → Admin issues materials
-7. **Manufacturing** → Assigned to manufacturer
-8. **Production** → Manufacturer updates status
-9. **Delivery** → Hand or courier delivery
-10. **Complete** → Job marked as delivered
+6. **Manufacturing** → Assigned to manufacturer
+7. **Production** → Manufacturer updates status
+8. **Delivery** → Hand or courier delivery
+9. **Complete** → Job marked as delivered
 
 ## License
 
