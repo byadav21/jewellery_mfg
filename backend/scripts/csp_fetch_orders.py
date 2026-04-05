@@ -24,6 +24,9 @@ CLIENT_ID = os.getenv("CSP_AMAZON_CLIENT_ID")
 CLIENT_SECRET = os.getenv("CSP_AMAZON_CLIENT_SECRET")
 REFRESH_TOKEN = os.getenv("CSP_AMAZON_REFRESH_TOKEN")
 MARKETPLACE_ID = os.getenv("CSP_AMAZON_MARKETPLACE_ID", "ATVPDKIKX0DER")
+# Pre-refreshed access token (from token refresh service)
+PRE_REFRESHED_ACCESS_TOKEN = os.getenv("CSP_AMAZON_ACCESS_TOKEN")
+PRE_REFRESHED_TOKEN_TIME = os.getenv("CSP_AMAZON_TOKEN_REFRESHED_AT")
 BASE_URL = "https://sellingpartnerapi-na.amazon.com"
 ACCOUNT_CODE = "CSP"
 
@@ -49,11 +52,28 @@ def log_message(message, level="INFO"):
         print(f"Failed to write log: {e}", file=sys.stderr)
 
 def get_access_token():
-    """Get LWA access token"""
+    """Get LWA access token - prefers pre-refreshed token if available and fresh"""
+    # Check for pre-refreshed token (from token refresh service)
+    if PRE_REFRESHED_ACCESS_TOKEN and PRE_REFRESHED_TOKEN_TIME:
+        try:
+            from datetime import datetime
+            refresh_time = datetime.fromisoformat(PRE_REFRESHED_TOKEN_TIME.replace('Z', '+00:00'))
+            now = datetime.now(timezone.utc)
+            age_minutes = (now - refresh_time).total_seconds() / 60
+
+            if age_minutes < 50:  # Token expires in 60 min, use if less than 50 min old
+                log_message(f"Using pre-refreshed access token (age: {age_minutes:.1f} minutes)")
+                return PRE_REFRESHED_ACCESS_TOKEN
+            else:
+                log_message(f"Pre-refreshed token too old ({age_minutes:.1f} minutes), getting fresh token")
+        except Exception as e:
+            log_message(f"Could not use pre-refreshed token: {e}", "WARNING")
+
+    # Fall back to getting fresh token
     if not all([CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN]):
         raise RuntimeError("Missing CSP Amazon credentials in .env")
 
-    log_message("Requesting LWA access token...")
+    log_message("Requesting fresh LWA access token...")
 
     resp = requests.post(
         "https://api.amazon.com/auth/o2/token",
@@ -70,7 +90,7 @@ def get_access_token():
         log_message(f"Token request failed: {resp.status_code} - {resp.text}", "ERROR")
         resp.raise_for_status()
 
-    log_message("Access token obtained successfully")
+    log_message("Fresh access token obtained successfully")
     return resp.json()["access_token"]
 
 def sp_api_get(path, params=None, access_token=None, max_retries=5):
@@ -136,6 +156,26 @@ def fetch_all_orders(access_token, days_back, max_results_per_page, fetch_all_pa
         created_before = end_date
         if not (created_before.endswith('Z') or '+' in created_before):
             created_before += 'T23:59:59Z'
+
+    # Amazon API requires CreatedBefore to be at least 2 minutes in the past
+    # Adjust if the calculated time is too recent
+    if created_before:
+        try:
+            # Parse the created_before datetime
+            if created_before.endswith('Z'):
+                cb_dt = datetime.fromisoformat(created_before.replace('Z', '+00:00'))
+            else:
+                cb_dt = datetime.fromisoformat(created_before)
+
+            # Current time minus 3 minutes (for safety margin)
+            max_allowed_time = datetime.now(timezone.utc) - timedelta(minutes=3)
+
+            # If created_before is in the future or too recent, adjust it
+            if cb_dt > max_allowed_time:
+                created_before = max_allowed_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+                log_message(f"Adjusted CreatedBefore to {created_before} (Amazon requires 2+ min in past)")
+        except Exception as e:
+            log_message(f"Warning: Could not validate CreatedBefore date: {e}", "WARNING")
 
     # Ensure max_results_per_page is within valid range
     max_results_per_page = max(1, min(100, max_results_per_page))
@@ -332,12 +372,22 @@ def build_order_data(orders, access_token):
             item_price = item.get("ItemPrice") or {}
             sku = item.get("SellerSKU")
             asin = item.get("ASIN")
-            
+
+            log_message(f"  - Processing item: SKU={sku}, ASIN={asin}")
+
             # Fetch and download image
             image_url = get_image_url(asin, access_token)
             local_image_path = None
+
             if image_url:
+                log_message(f"  - Got image URL for {asin}, attempting download...")
                 local_image_path = download_image(image_url, sku)
+                if local_image_path:
+                    log_message(f"  - Image downloaded successfully: {local_image_path}")
+                else:
+                    log_message(f"  - Image download failed for {asin}", "WARNING")
+            else:
+                log_message(f"  - No image URL found for ASIN {asin}", "WARNING")
 
             order_data["items"].append({
                 "sku": sku,
@@ -386,64 +436,108 @@ def extract_image_url_from_catalog_payload(payload):
     return find_url(payload)
 
 def fetch_primary_image_for_asin(asin, access_token):
-    """Fetch primary image URL for ASIN from Catalog API"""
+    """Fetch primary image URL for ASIN from Catalog API v2022-04-01"""
     if not asin:
+        log_message(f"[Image] No ASIN provided, skipping image fetch", "WARNING")
         return None
 
-    path = f"/catalog/v0/items/{asin}"
-    params = {"MarketplaceId": MARKETPLACE_ID}
+    # Use v2022-04-01 API (same as Node.js service)
+    path = f"/catalog/2022-04-01/items/{asin}"
+    params = {
+        "marketplaceIds": MARKETPLACE_ID,
+        "includedData": "images,summaries"
+    }
 
     try:
-        # Use existing sp_api_get with retry logic
+        log_message(f"[Image] Fetching image for ASIN: {asin}")
         data = sp_api_get(path, params=params, access_token=access_token)
-        payload = data.get("payload", {})
-        return extract_image_url_from_catalog_payload(payload)
+
+        log_message(f"[Image] API response keys for {asin}: {list(data.keys()) if data else 'None'}")
+
+        # Extract images from v2022-04-01 response structure
+        # Structure: { images: [{ marketplaceId, images: [{ variant, link, ... }] }] }
+        images = data.get("images", [])
+        log_message(f"[Image] Found {len(images)} marketplace image groups for {asin}")
+
+        for marketplace_images in images:
+            img_list = marketplace_images.get("images", [])
+            log_message(f"[Image] Found {len(img_list)} images in marketplace group for {asin}")
+
+            # First try to find MAIN variant
+            for img in img_list:
+                if img.get("variant") == "MAIN" and img.get("link"):
+                    log_message(f"[Image] Found MAIN image for {asin}: {img.get('link')[:80]}...")
+                    return img.get("link")
+
+            # If no MAIN, return first available with link
+            for img in img_list:
+                if img.get("link"):
+                    log_message(f"[Image] Using first available image for {asin}: {img.get('link')[:80]}...")
+                    return img.get("link")
+
+        log_message(f"[Image] No images found for ASIN {asin}", "WARNING")
+        return None
     except Exception as e:
-        log_message(f"Failed to fetch image for ASIN {asin}: {e}", "WARNING")
+        log_message(f"[Image] Failed to fetch image for ASIN {asin}: {e}", "WARNING")
+        import traceback
+        log_message(f"[Image] Traceback: {traceback.format_exc()}", "WARNING")
         return None
 
 def download_image(url, sku):
-    """Download image to sku_images/{SKU}/"""
+    """Download image to uploads/product-images/{SKU}/"""
     if not url or not sku:
+        log_message(f"[Download] Missing url or sku - url: {bool(url)}, sku: {bool(sku)}", "WARNING")
         return None
 
-    # Clean SKU
-    safe_sku = "".join(c for c in sku if c.isalnum() or c in ('-', '_')).strip()
+    log_message(f"[Download] Starting download for SKU {sku}")
+
+    # Clean SKU - uppercase and remove special chars (matching Node.js service)
+    safe_sku = sku.upper().replace(" ", "_")
+    safe_sku = "".join(c for c in safe_sku if c.isalnum() or c in ('-', '_')).strip()
     if not safe_sku:
         safe_sku = "unknown_sku"
+        log_message(f"[Download] SKU normalized to 'unknown_sku'", "WARNING")
 
-    # Directory relative to script execution (usually backend root)
-    # We want it in backend/sku_images or just sku_images
-    base_dir = Path("sku_images") 
+    # Directory to match Node.js service path: uploads/product-images/{SKU}/
+    base_dir = Path(__file__).parent.parent / "uploads" / "product-images"
     sku_dir = base_dir / safe_sku
-    
+
+    log_message(f"[Download] Target directory: {sku_dir}")
+
     try:
         sku_dir.mkdir(parents=True, exist_ok=True)
+        log_message(f"[Download] Directory created/verified: {sku_dir}")
     except Exception as e:
-        log_message(f"Failed to create directory {sku_dir}: {e}", "ERROR")
+        log_message(f"[Download] Failed to create directory {sku_dir}: {e}", "ERROR")
         return None
 
     filename = url.split('/')[-1].split('?')[0]
-    if not filename:
-        filename = "image.jpg"
-    
+    if not filename or '.' not in filename:
+        filename = f"{safe_sku}_amazon_1.jpg"
+        log_message(f"[Download] Generated filename: {filename}")
+
     file_path = sku_dir / filename
-    
+
+    # Return web-accessible path format (matching Node.js service)
+    web_path = f"/uploads/product-images/{safe_sku}/{filename}"
+
     # Skip if exists
     if file_path.exists():
-        return str(file_path)
+        log_message(f"[Download] File already exists, returning: {web_path}")
+        return web_path
 
     try:
+        log_message(f"[Download] Downloading from: {url[:100]}...")
         resp = requests.get(url, timeout=30)
         resp.raise_for_status()
-        
+
         with open(file_path, 'wb') as f:
             f.write(resp.content)
-            
-        log_message(f"Downloaded image for {sku}: {filename}")
-        return str(file_path)
+
+        log_message(f"[Download] Successfully saved: {file_path} ({len(resp.content)} bytes)")
+        return web_path
     except Exception as e:
-        log_message(f"Failed to download image from {url}: {e}", "WARNING")
+        log_message(f"[Download] Failed to download image from {url}: {e}", "WARNING")
         return None
 
 def parse_args():

@@ -28,7 +28,7 @@ router.post('/:jobId/ready-qc', manufacturerOrAbove, manufacturingController.mar
 router.post('/:jobId/ready-delivery', manufacturerOrAbove, manufacturingController.markReadyForDelivery);
 
 // File operations
-router.get('/:jobId/files', manufacturerOrAbove, manufacturingController.getFiles);
+router.get('/:jobId/files', manufacturingController.getFiles); // All authenticated users can view files
 router.post('/:jobId/upload', manufacturerOrAbove, productionUpload, handleUploadError, manufacturingController.uploadFiles);
 
 // Admin routes

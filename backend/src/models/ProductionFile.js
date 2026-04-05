@@ -21,7 +21,7 @@ const productionFileSchema = new mongoose.Schema({
   },
   fileType: {
     type: String,
-    enum: ['image', 'video', 'other'],
+    enum: ['image', 'video', 'document', 'other'],
     default: 'image'
   },
   mimeType: {

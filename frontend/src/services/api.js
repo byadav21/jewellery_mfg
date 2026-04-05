@@ -1,7 +1,7 @@
 import axios from 'axios';
 import { toast } from 'react-toastify';
 
-const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:5001/api';
+const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:5002/api';
 
 const api = axios.create({
   baseURL: API_BASE_URL,
@@ -106,7 +106,10 @@ export const jobAPI = {
   updateStatus: (id, status, remarks) => api.put(`/jobs/${id}/status`, { status, remarks }),
   cancel: (id, reason) => api.put(`/jobs/${id}/cancel`, { reason }),
   getHistory: (id) => api.get(`/jobs/${id}/history`),
-  getStatistics: () => api.get('/jobs/statistics')
+  getStatistics: () => api.get('/jobs/statistics'),
+  downloadImagesZip: (id, type) => api.get(`/jobs/${id}/download-images`, { params: { type }, responseType: 'blob' }),
+  getSubStatusOptions: () => api.get('/jobs/sub-status-options'),
+  updateSubStatus: (id, subStatus, remarks) => api.put(`/jobs/${id}/sub-status`, { subStatus, remarks })
 };
 
 export const orderAPI = {
@@ -126,11 +129,13 @@ export const orderAPI = {
   bulkUpdateStatus: (data) => api.post('/orders/bulk-status', data),
   triggerSync: (syncType) => api.post('/orders/sync/trigger', { syncType }),
   bulkDownload: (orderIds) => api.post('/orders/bulk-download', { orderIds }, { responseType: 'blob' }),
-  fetchProductImages: (asin, sku, accountCode) => api.post('/orders/fetch-images', { asin, sku, accountCode }),
+  fetchProductImages: (params) => api.post('/orders/fetch-images', params), // params: { asin, sku, accountCode, channel, itemId }
   uploadImages: (id, formData) => api.post(`/orders/${id}/images`, formData, {
     headers: { 'Content-Type': 'multipart/form-data' }
   }),
-  deleteImage: (id, imageId) => api.delete(`/orders/${id}/images/${imageId}`)
+  deleteImage: (id, imageId) => api.delete(`/orders/${id}/images/${imageId}`),
+  delete: (id, deleteType = 'soft') => api.delete(`/orders/${id}?deleteType=${deleteType}`),
+  downloadImagesZip: (id) => api.get(`/orders/${id}/download-images`, { responseType: 'blob' })
 };
 
 export const cadAPI = {

@@ -41,14 +41,6 @@ exports.assignManufacturer = async (req, res) => {
       });
     }
 
-    // Check if components are issued
-    if (!['components_issued', 'cad_approved'].includes(job.status)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Components must be issued before assigning manufacturer'
-      });
-    }
-
     // Check if job has CAD/STL file before assigning manufacturer
     let hasCadFile = !!(job.cadFilePath || job.hasCadFile);
 
@@ -59,10 +51,14 @@ exports.assignManufacturer = async (req, res) => {
     }
 
     if (!hasCadFile) {
-      return res.status(400).json({
-        success: false,
-        message: `Cannot assign manufacturer without CAD/STL file. Job ${job.jobCode} (SKU: ${job.sku || 'N/A'}) has no CAD file.`
-      });
+      // Super admin can bypass CAD file requirement
+      const isSuperAdmin = req.user?.roles?.some(r => r.name === 'super_admin');
+      if (!isSuperAdmin) {
+        return res.status(400).json({
+          success: false,
+          message: `Cannot assign manufacturer without CAD/STL file. Job ${job.jobCode} (SKU: ${job.sku || 'N/A'}) has no CAD file.`
+        });
+      }
     }
 
     const oldStatus = job.status;
@@ -174,6 +170,16 @@ exports.acceptJob = async (req, res) => {
 
     await notificationService.sendStatusChangeNotification(job, oldStatus, 'manufacturing_accepted', req.userId);
 
+    await AuditLog.log({
+      user: req.userId,
+      action: 'manufacturing_accept',
+      entity: 'job',
+      entityId: job._id,
+      description: `Manufacturer accepted job: ${job.jobCode}`,
+      ipAddress: req.ip,
+      userAgent: req.get('User-Agent')
+    });
+
     res.json({
       success: true,
       message: 'Job accepted'
@@ -219,6 +225,16 @@ exports.startWork = async (req, res) => {
     });
 
     await notificationService.sendStatusChangeNotification(job, oldStatus, 'manufacturing_in_progress', req.userId);
+
+    await AuditLog.log({
+      user: req.userId,
+      action: 'manufacturing_start',
+      entity: 'job',
+      entityId: job._id,
+      description: `Manufacturing started for job: ${job.jobCode}`,
+      ipAddress: req.ip,
+      userAgent: req.get('User-Agent')
+    });
 
     res.json({
       success: true,
@@ -268,6 +284,17 @@ exports.markReadyForQC = async (req, res) => {
 
     await notificationService.sendStatusChangeNotification(job, oldStatus, 'manufacturing_ready_qc', req.userId);
 
+    await AuditLog.log({
+      user: req.userId,
+      action: 'manufacturing_ready_qc',
+      entity: 'job',
+      entityId: job._id,
+      description: `Job marked ready for QC: ${job.jobCode}`,
+      metadata: { remarks: remarks || null },
+      ipAddress: req.ip,
+      userAgent: req.get('User-Agent')
+    });
+
     res.json({
       success: true,
       message: 'Marked ready for QC'
@@ -310,6 +337,17 @@ exports.markReadyForDelivery = async (req, res) => {
 
     await notificationService.sendStatusChangeNotification(job, oldStatus, 'manufacturing_ready_delivery', req.userId);
 
+    await AuditLog.log({
+      user: req.userId,
+      action: 'manufacturing_ready_delivery',
+      entity: 'job',
+      entityId: job._id,
+      description: `Job marked ready for delivery: ${job.jobCode}`,
+      metadata: { remarks: remarks || null },
+      ipAddress: req.ip,
+      userAgent: req.get('User-Agent')
+    });
+
     res.json({
       success: true,
       message: 'Marked ready for delivery'
@@ -323,9 +361,10 @@ exports.markReadyForDelivery = async (req, res) => {
   }
 };
 
-// Upload production files
+// Upload production files (saves to product-images/{SKU}/Final_product/)
 exports.uploadFiles = async (req, res) => {
   try {
+    const fs = require('fs');
     const job = await Job.findById(req.params.jobId);
 
     if (!job) {
@@ -342,8 +381,20 @@ exports.uploadFiles = async (req, res) => {
       });
     }
 
-    const uploadedFiles = [];
     const stage = req.body.stage || 'final';
+    const uploadedFiles = [];
+
+    // Determine final product folder based on SKU
+    let finalProductDir = null;
+    let finalProductRelPath = null;
+    if (job.sku && stage === 'final') {
+      const skuFolder = job.sku.toUpperCase();
+      finalProductDir = path.join(__dirname, '../../uploads/product-images', skuFolder, 'Final_product');
+      finalProductRelPath = `/uploads/product-images/${skuFolder}/Final_product`;
+      if (!fs.existsSync(finalProductDir)) {
+        fs.mkdirSync(finalProductDir, { recursive: true });
+      }
+    }
 
     for (const file of req.files) {
       const ext = path.extname(file.originalname).toLowerCase();
@@ -353,12 +404,32 @@ exports.uploadFiles = async (req, res) => {
         fileType = 'image';
       } else if (['.mp4', '.mov', '.avi', '.mkv'].includes(ext)) {
         fileType = 'video';
+      } else if (['.pdf'].includes(ext)) {
+        fileType = 'document';
+      }
+
+      let savedFilePath = `/uploads/production/${file.filename}`;
+
+      // Move final stage files to product-images/{SKU}/Final_product/
+      if (finalProductDir && stage === 'final') {
+        const timestamp = Date.now();
+        const newFilename = `${job.sku.toUpperCase()}_final_${timestamp}${ext}`;
+        const destPath = path.join(finalProductDir, newFilename);
+        try {
+          fs.renameSync(file.path, destPath);
+          savedFilePath = `${finalProductRelPath}/${newFilename}`;
+        } catch (moveErr) {
+          // If rename fails (cross-device), copy and delete
+          fs.copyFileSync(file.path, destPath);
+          fs.unlinkSync(file.path);
+          savedFilePath = `${finalProductRelPath}/${newFilename}`;
+        }
       }
 
       const productionFile = await ProductionFile.create({
         job: job._id,
         uploadedBy: req.userId,
-        filePath: `/uploads/production/${file.filename}`,
+        filePath: savedFilePath,
         fileName: file.originalname,
         fileType,
         mimeType: file.mimetype,
@@ -369,6 +440,22 @@ exports.uploadFiles = async (req, res) => {
 
       uploadedFiles.push(productionFile);
     }
+
+    // Audit log
+    await AuditLog.log({
+      user: req.userId,
+      action: 'manufacturing_upload_files',
+      entity: 'job',
+      entityId: job._id,
+      description: `Uploaded ${uploadedFiles.length} ${stage} file(s) for job: ${job.jobCode}`,
+      metadata: {
+        stage,
+        fileCount: uploadedFiles.length,
+        fileNames: uploadedFiles.map(f => f.fileName)
+      },
+      ipAddress: req.ip,
+      userAgent: req.get('User-Agent')
+    });
 
     res.json({
       success: true,
@@ -407,7 +494,7 @@ exports.getFiles = async (req, res) => {
 // Get my manufacturing jobs (for manufacturers)
 exports.getMyJobs = async (req, res) => {
   try {
-    const { status } = req.query;
+    const { status, search } = req.query;
 
     const query = {
       manufacturer: req.userId
@@ -425,6 +512,15 @@ exports.getMyJobs = async (req, res) => {
           'manufacturing_ready_delivery'
         ]
       };
+    }
+
+    if (search) {
+      query.$or = [
+        { jobCode: { $regex: search, $options: 'i' } },
+        { sku: { $regex: search, $options: 'i' } },
+        { productName: { $regex: search, $options: 'i' } },
+        { customerName: { $regex: search, $options: 'i' } }
+      ];
     }
 
     const jobs = await Job.find(query)
@@ -448,10 +544,23 @@ exports.getMyJobs = async (req, res) => {
 // Get jobs pending manufacturing assignment
 exports.getPendingAssignment = async (req, res) => {
   try {
-    const jobs = await Job.find({
+    const { search } = req.query;
+
+    const query = {
       status: { $in: ['components_issued', 'cad_approved'] },
       manufacturer: null
-    })
+    };
+
+    if (search) {
+      query.$or = [
+        { jobCode: { $regex: search, $options: 'i' } },
+        { sku: { $regex: search, $options: 'i' } },
+        { productName: { $regex: search, $options: 'i' } },
+        { customerName: { $regex: search, $options: 'i' } }
+      ];
+    }
+
+    const jobs = await Job.find(query)
       .populate('cadDesigner', 'name email')
       .populate('order')
       .sort({ dueDate: 1, createdAt: 1 });

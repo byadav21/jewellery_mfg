@@ -57,8 +57,11 @@ const seedRoles = async () => {
       await Role.create(roleData);
       console.log(`  ✓ Created role: ${roleData.displayName}`);
     } else {
-      // Update permissions for existing roles to ensure they have the latest
+      // Update permissions and displayName for existing roles to ensure they have the latest
       existingRole.permissions = Role.getDefaultPermissions(roleData.name);
+      existingRole.displayName = roleData.displayName;
+      existingRole.description = roleData.description;
+      existingRole.isSystem = roleData.isSystem;
       await existingRole.save();
       console.log(`  ✓ Updated permissions for role: ${roleData.displayName}`);
     }

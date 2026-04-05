@@ -102,7 +102,16 @@ exports.getDockets = async (req, res) => {
         if (status) query.status = status;
 
         if (search) {
-            query.docketNumber = { $regex: search, $options: 'i' };
+            const matchingManufacturers = await User.find(
+                { name: { $regex: search, $options: 'i' } },
+                '_id'
+            ).lean();
+            const manufacturerIds = matchingManufacturers.map(u => u._id);
+
+            query.$or = [
+                { docketNumber: { $regex: search, $options: 'i' } },
+                ...(manufacturerIds.length > 0 ? [{ manufacturer: { $in: manufacturerIds } }] : [])
+            ];
         }
 
         if (startDate || endDate) {

@@ -1,4 +1,6 @@
 const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
 const { execSync } = require('child_process');
 const { applyAutoAssignment } = require('../utils/assignment.utils');
 const { SystemSettings, MarketplaceOrder, MarketplaceOrderItem, Job, AuditLog, SkuMaster, MarketplaceAccount } = require('../models');
@@ -954,12 +956,16 @@ class AmazonService {
 
   /**
    * Fetch product images from Amazon Catalog Items API
+   * Uses the same API pattern as the reference amazon_image project
    * @param {string} asin - The ASIN of the product
    * @param {object} credentials - Optional credentials for specific account
    * @param {string} accountCode - Optional account code
+   * @param {number} retryCount - Internal retry counter
    * @returns {Promise<object>} - Product images data
    */
-  async getProductImages(asin, credentials = null, accountCode = null) {
+  async getProductImages(asin, credentials = null, accountCode = null, retryCount = 0) {
+    const cacheKey = accountCode || 'default';
+
     try {
       if (!asin) {
         return { success: false, message: 'ASIN is required', images: [] };
@@ -968,34 +974,47 @@ class AmazonService {
       const creds = credentials || await this.getCredentials();
       const accessToken = await this.getAccessToken(credentials, accountCode);
 
-      // Use Catalog Items API v2022-04-01 to get product images
+      console.log(`[${cacheKey}] Fetching product images for ASIN: ${asin}`);
+
+      // Use Catalog Items API v2022-04-01 with full includedData (matching reference project)
       const response = await axios({
         method: 'GET',
         url: `${this.baseUrl}/catalog/2022-04-01/items/${asin}`,
         headers: {
           'x-amz-access-token': accessToken,
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
         },
         params: {
-          marketplaceIds: creds.marketplaceId,
-          includedData: 'images,summaries'
-        }
+          marketplaceIds: creds.marketplaceId || 'ATVPDKIKX0DER',
+          includedData: 'summaries,attributes,images,productTypes,dimensions'
+        },
+        timeout: 60000
       });
 
       const item = response.data;
       const images = [];
 
-      // Extract images from the response
-      if (item.images) {
-        for (const imageSet of item.images) {
-          if (imageSet.images) {
-            for (const img of imageSet.images) {
-              images.push({
-                url: img.link,
-                variant: img.variant,
-                height: img.height,
-                width: img.width
-              });
+      console.log(`[${cacheKey}] Catalog API response for ${asin}:`, JSON.stringify({
+        hasImages: !!item.images,
+        imageArrayLength: item.images?.length || 0,
+        hasSummaries: !!item.summaries
+      }));
+
+      // Extract images from the response (nested structure per reference project)
+      // Structure: item.images = [{images: [{link, variant, height, width}, ...]}, ...]
+      if (item.images && Array.isArray(item.images)) {
+        for (const marketplaceImages of item.images) {
+          if (marketplaceImages.images && Array.isArray(marketplaceImages.images)) {
+            for (const img of marketplaceImages.images) {
+              if (img.link) {
+                images.push({
+                  url: img.link,
+                  variant: img.variant || 'MAIN',
+                  height: img.height,
+                  width: img.width
+                });
+              }
             }
           }
         }
@@ -1007,6 +1026,8 @@ class AmazonService {
         productTitle = item.summaries[0].itemName || '';
       }
 
+      console.log(`[${cacheKey}] Found ${images.length} images for ASIN ${asin}`);
+
       return {
         success: true,
         asin,
@@ -1016,7 +1037,21 @@ class AmazonService {
       };
 
     } catch (error) {
-      console.error(`Error fetching product images for ASIN ${asin}:`, error.response?.data || error.message);
+      // Handle rate limiting (429) - retry with backoff like reference project
+      if (error.response?.status === 429 && retryCount < 3) {
+        const retryAfter = parseInt(error.response.headers?.['retry-after'] || '30', 10);
+        console.log(`[${cacheKey}] [Rate Limit] Waiting ${retryAfter}s before retry for ASIN ${asin}...`);
+        await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+        return this.getProductImages(asin, credentials, accountCode, retryCount + 1);
+      }
+
+      console.error(`[${cacheKey}] Error fetching product images for ASIN ${asin}:`, {
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        data: error.response?.data,
+        message: error.message
+      });
+
       return {
         success: false,
         message: error.response?.data?.errors?.[0]?.message || error.message,
@@ -1027,6 +1062,7 @@ class AmazonService {
 
   /**
    * Fetch and download product images to local storage
+   * Images are saved in SKU-wise folders: /uploads/product-images/{SKU}/
    * @param {string} asin - The ASIN of the product
    * @param {string} sku - The SKU to associate images with
    * @param {object} credentials - Optional credentials
@@ -1034,19 +1070,34 @@ class AmazonService {
    * @returns {Promise<object>} - Downloaded images info
    */
   async downloadProductImages(asin, sku, credentials = null, accountCode = null) {
+    const cacheKey = accountCode || 'default';
+    console.log(`[${cacheKey}] [Image Download] Starting download for ASIN: ${asin}, SKU: ${sku}`);
+
     try {
       const imageData = await this.getProductImages(asin, credentials, accountCode);
 
-      if (!imageData.success || imageData.images.length === 0) {
+      if (!imageData.success) {
+        console.log(`[${cacheKey}] [Image Download] Failed to fetch images: ${imageData.message}`);
         return imageData;
       }
 
-      const downloadedImages = [];
-      const uploadDir = path.join(__dirname, '../../uploads/product-images');
+      if (imageData.images.length === 0) {
+        console.log(`[${cacheKey}] [Image Download] No images found for ASIN: ${asin}`);
+        return imageData;
+      }
 
-      // Ensure directory exists
-      if (!fs.existsSync(uploadDir)) {
-        fs.mkdirSync(uploadDir, { recursive: true });
+      console.log(`[${cacheKey}] [Image Download] Found ${imageData.images.length} images, downloading...`);
+
+      const downloadedImages = [];
+
+      // Create SKU-wise folder structure
+      const normalizedSku = (sku || asin).toUpperCase().replace(/[^a-zA-Z0-9-_]/g, '_');
+      const skuDir = path.join(__dirname, '../../uploads/product-images', normalizedSku);
+
+      // Ensure SKU directory exists
+      if (!fs.existsSync(skuDir)) {
+        fs.mkdirSync(skuDir, { recursive: true });
+        console.log(`[${cacheKey}] [Image Download] Created SKU folder: ${skuDir}`);
       }
 
       // Download up to 5 main images
@@ -1060,24 +1111,27 @@ class AmazonService {
           const response = await axios({
             method: 'GET',
             url: img.url,
-            responseType: 'arraybuffer'
+            responseType: 'arraybuffer',
+            timeout: 30000
           });
 
           const ext = '.jpg';
-          const fileName = `${sku}_${asin}_${i + 1}${ext}`;
-          const filePath = path.join(uploadDir, fileName);
+          const fileName = `${normalizedSku}_amazon_${asin}_${i + 1}${ext}`;
+          const filePath = path.join(skuDir, fileName);
 
           fs.writeFileSync(filePath, response.data);
 
           downloadedImages.push({
             fileName,
-            filePath: `/uploads/product-images/${fileName}`,
+            filePath: `/uploads/product-images/${normalizedSku}/${fileName}`,
             originalUrl: img.url,
             variant: img.variant
           });
 
+          console.log(`[${cacheKey}] [Image Download] Saved: ${fileName}`);
+
         } catch (downloadError) {
-          console.error(`Failed to download image ${i + 1} for ${asin}:`, downloadError.message);
+          console.error(`[${cacheKey}] [Image Download] Failed to download image ${i + 1} for ${asin}:`, downloadError.message);
         }
       }
 

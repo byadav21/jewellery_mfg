@@ -20,7 +20,7 @@ const MFG_STAGES = [
 ];
 
 const ManufacturingDetail = () => {
-  const { id } = useParams();
+  const { jobId: id } = useParams();
   const navigate = useNavigate();
   const { user } = useAuth();
   const fileInputRef = useRef(null);
@@ -38,6 +38,12 @@ const ManufacturingDetail = () => {
   const [newStatus, setNewStatus] = useState('');
   const [statusRemarks, setStatusRemarks] = useState('');
 
+  // Sub-status state
+  const [subStatusOptions, setSubStatusOptions] = useState({});
+  const [showSubStatusModal, setShowSubStatusModal] = useState(false);
+  const [newSubStatus, setNewSubStatus] = useState('');
+  const [subStatusRemarks, setSubStatusRemarks] = useState('');
+
   // Assignment state
   const [showAssignModal, setShowAssignModal] = useState(false);
   const [manufacturers, setManufacturers] = useState([]);
@@ -47,6 +53,30 @@ const ManufacturingDetail = () => {
 
   // File upload state
   const [uploading, setUploading] = useState(false);
+  const [uploadStage, setUploadStage] = useState('final');
+  const [uploadRemarks, setUploadRemarks] = useState('');
+  const [showUploadModal, setShowUploadModal] = useState(false);
+  const [downloadingZip, setDownloadingZip] = useState(false);
+
+  // ZIP download helper
+  const handleDownloadZip = async (type) => {
+    try {
+      setDownloadingZip(true);
+      const response = await jobAPI.downloadImagesZip(id, type);
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', `${job?.sku || job?.jobCode || 'files'}_${type || 'all'}.zip`);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (error) {
+      toast.error('Failed to download ZIP');
+    } finally {
+      setDownloadingZip(false);
+    }
+  };
 
   // User role check
   const userRoles = user?.roles?.map(r => r.name || r) || [];
@@ -118,6 +148,36 @@ const ManufacturingDetail = () => {
       fetchManufacturers();
     }
   }, [isSuperAdmin, fetchManufacturers]);
+
+  // Fetch sub-status options
+  useEffect(() => {
+    jobAPI.getSubStatusOptions().then(res => {
+      setSubStatusOptions(res.data.data || {});
+    }).catch(() => {});
+  }, []);
+
+  // Handle sub-status change
+  const handleSubStatusChange = async (e) => {
+    e.preventDefault();
+    if (!newSubStatus) {
+      toast.error('Please select a sub-status');
+      return;
+    }
+    try {
+      setSubmitting(true);
+      await jobAPI.updateSubStatus(id, newSubStatus, subStatusRemarks);
+      toast.success('Sub-status updated');
+      setShowSubStatusModal(false);
+      setNewSubStatus('');
+      setSubStatusRemarks('');
+      fetchJob();
+      fetchStatusHistory();
+    } catch (error) {
+      toast.error(error.response?.data?.message || 'Failed to update sub-status');
+    } finally {
+      setSubmitting(false);
+    }
+  };
 
   // Handle manufacturing actions
   const handleAccept = async () => {
@@ -243,12 +303,18 @@ const ManufacturingDetail = () => {
     for (let i = 0; i < files.length; i++) {
       formData.append('files', files[i]);
     }
+    formData.append('stage', uploadStage);
+    if (uploadRemarks) {
+      formData.append('remarks', uploadRemarks);
+    }
 
     try {
       setUploading(true);
 
       await manufacturingAPI.uploadFiles(id, formData);
       toast.success(`${files.length} file(s) uploaded successfully`);
+      setShowUploadModal(false);
+      setUploadRemarks('');
       fetchManufacturingFiles();
       fetchJob();
     } catch (error) {
@@ -634,6 +700,27 @@ const ManufacturingDetail = () => {
                         </td>
                       </tr>
                       <tr>
+                        <td className="text-muted">Sub-Status:</td>
+                        <td>
+                          {job.subStatus ? (
+                            <span className="badge badge-outline-primary border" style={{ fontSize: '12px' }}>
+                              {job.subStatus}
+                            </span>
+                          ) : (
+                            <span className="text-muted">-</span>
+                          )}
+                          {(isAssignedManufacturer || isSuperAdmin) && subStatusOptions[job.status]?.length > 0 && (
+                            <button
+                              className="btn btn-xs btn-outline-secondary ml-2"
+                              onClick={() => { setNewSubStatus(job.subStatus || ''); setShowSubStatusModal(true); }}
+                              title="Update sub-status"
+                            >
+                              <i className="fas fa-edit"></i>
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                      <tr>
                         <td className="text-muted">Priority:</td>
                         <td>
                           <span className={`badge badge-${getPriorityBadge(job.priority)}`}>
@@ -781,34 +868,28 @@ const ManufacturingDetail = () => {
                 Manufacturing Files ({manufacturingFiles.length})
               </h3>
               <div className="card-tools">
-                {(isAssignedManufacturer || isSuperAdmin) && ['manufacturing_in_progress', 'manufacturing_ready_qc', 'ready_for_qc'].includes(job.status) && (
-                  <>
-                    <input
-                      type="file"
-                      ref={fileInputRef}
-                      onChange={handleFileUpload}
-                      multiple
-                      className="d-none"
-                      accept=".jpg,.jpeg,.png,.pdf,.stl,.obj,.zip"
-                    />
-                    <button
-                      className="btn btn-primary btn-sm"
-                      onClick={() => fileInputRef.current?.click()}
-                      disabled={uploading}
-                    >
-                      {uploading ? (
-                        <>
-                          <span className="spinner-border spinner-border-sm mr-1"></span>
-                          Uploading...
-                        </>
-                      ) : (
-                        <>
-                          <i className="fas fa-upload mr-1"></i>
-                          Upload Files
-                        </>
-                      )}
-                    </button>
-                  </>
+                {manufacturingFiles.length > 0 && (
+                  <button
+                    className="btn btn-outline-success btn-sm mr-2"
+                    onClick={() => handleDownloadZip('manufacturing')}
+                    disabled={downloadingZip}
+                  >
+                    {downloadingZip ? (
+                      <><span className="spinner-border spinner-border-sm mr-1"></span> Zipping...</>
+                    ) : (
+                      <><i className="fas fa-file-archive mr-1"></i> Download All (ZIP)</>
+                    )}
+                  </button>
+                )}
+                {(isAssignedManufacturer || isSuperAdmin) && (
+                  <button
+                    className="btn btn-primary btn-sm"
+                    onClick={() => setShowUploadModal(true)}
+                    disabled={uploading}
+                  >
+                    <i className="fas fa-upload mr-1"></i>
+                    Upload Files
+                  </button>
                 )}
               </div>
             </div>
@@ -821,10 +902,10 @@ const ManufacturingDetail = () => {
                 <div className="text-center text-muted py-4">
                   <i className="fas fa-folder-open fa-2x mb-2"></i>
                   <p>No manufacturing files uploaded yet</p>
-                  {(isAssignedManufacturer || isSuperAdmin) && ['manufacturing_in_progress', 'manufacturing_ready_qc', 'ready_for_qc'].includes(job.status) && (
+                  {(isAssignedManufacturer || isSuperAdmin) && (
                     <button
                       className="btn btn-outline-primary btn-sm"
-                      onClick={() => fileInputRef.current?.click()}
+                      onClick={() => setShowUploadModal(true)}
                       disabled={uploading}
                     >
                       <i className="fas fa-upload mr-1"></i>
@@ -833,41 +914,85 @@ const ManufacturingDetail = () => {
                   )}
                 </div>
               ) : (
-                <div className="row">
-                  {manufacturingFiles.map((file, idx) => (
-                    <div key={idx} className="col-md-3 col-sm-4 col-6 mb-3">
-                      <div className="card h-100">
-                        <div className="card-body text-center p-2">
-                          {file.mimetype?.startsWith('image/') ? (
-                            <img
-                              src={`${API_BASE_URL}${file.path}`}
-                              alt={file.filename}
-                              className="img-fluid img-thumbnail mb-2"
-                              style={{ maxHeight: '100px', objectFit: 'cover', cursor: 'pointer' }}
-                              onClick={() => window.open(`${API_BASE_URL}${file.path}`, '_blank')}
-                            />
-                          ) : (
-                            <div className="py-3">
-                              <i className={`fas ${file.mimetype?.includes('pdf') ? 'fa-file-pdf text-danger' : 'fa-file'} fa-3x`}></i>
-                            </div>
-                          )}
-                          <p className="small text-truncate mb-1" title={file.filename}>
-                            {file.filename || file.originalname}
-                          </p>
-                          <a
-                            href={`${API_BASE_URL}${file.path}`}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="btn btn-sm btn-outline-primary"
-                            download
-                          >
-                            <i className="fas fa-download"></i>
-                          </a>
+                <>
+                  {/* Group files by stage */}
+                  {['final', 'qc', 'in_progress'].map(stage => {
+                    const stageFiles = manufacturingFiles.filter(f => (f.stage || 'final') === stage);
+                    if (stageFiles.length === 0) return null;
+                    const stageLabels = { final: 'Final Product', qc: 'QC / Inspection', in_progress: 'In Progress' };
+                    const stageColors = { final: 'success', qc: 'info', in_progress: 'warning' };
+                    return (
+                      <div key={stage} className="mb-3">
+                        <h6>
+                          <span className={`badge badge-${stageColors[stage]} mr-2`}>{stageLabels[stage]}</span>
+                          ({stageFiles.length} files)
+                        </h6>
+                        <div className="row">
+                          {stageFiles.map((file, idx) => {
+                            const filePath = file.filePath || file.path;
+                            const fileName = file.fileName || file.filename || file.originalname;
+                            const isImage = file.fileType === 'image' || file.mimeType?.startsWith('image/') || file.mimetype?.startsWith('image/');
+                            const isVideo = file.fileType === 'video' || file.mimeType?.startsWith('video/') || file.mimetype?.startsWith('video/');
+                            const isPdf = file.fileType === 'document' || file.mimeType?.includes('pdf') || file.mimetype?.includes('pdf');
+
+                            return (
+                              <div key={file._id || idx} className="col-md-3 col-sm-4 col-6 mb-3">
+                                <div className="card h-100">
+                                  <div className="card-body text-center p-2">
+                                    {isImage ? (
+                                      <img
+                                        src={`${API_BASE_URL}${filePath}`}
+                                        alt={fileName}
+                                        className="img-fluid img-thumbnail mb-2"
+                                        style={{ maxHeight: '120px', objectFit: 'cover', cursor: 'pointer' }}
+                                        onClick={() => window.open(`${API_BASE_URL}${filePath}`, '_blank')}
+                                      />
+                                    ) : isVideo ? (
+                                      <div className="py-2">
+                                        <video
+                                          src={`${API_BASE_URL}${filePath}`}
+                                          style={{ maxHeight: '120px', maxWidth: '100%', cursor: 'pointer' }}
+                                          onClick={() => window.open(`${API_BASE_URL}${filePath}`, '_blank')}
+                                          muted
+                                        />
+                                        <div><i className="fas fa-video text-primary"></i></div>
+                                      </div>
+                                    ) : (
+                                      <div className="py-3">
+                                        <i className={`fas ${isPdf ? 'fa-file-pdf text-danger' : 'fa-file text-secondary'} fa-3x`}></i>
+                                      </div>
+                                    )}
+                                    <p className="small text-truncate mb-1" title={fileName}>
+                                      {fileName}
+                                    </p>
+                                    {file.remarks && (
+                                      <p className="small text-muted mb-1" title={file.remarks}>
+                                        <i className="fas fa-comment mr-1"></i>{file.remarks}
+                                      </p>
+                                    )}
+                                    <small className="text-muted d-block mb-1">
+                                      {file.uploadedBy?.name && <span>{file.uploadedBy.name} - </span>}
+                                      {file.uploadedAt ? new Date(file.uploadedAt).toLocaleDateString() : ''}
+                                    </small>
+                                    <a
+                                      href={`${API_BASE_URL}${filePath}`}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="btn btn-sm btn-outline-primary"
+                                      download
+                                    >
+                                      <i className="fas fa-download mr-1"></i> Download
+                                    </a>
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })}
                         </div>
                       </div>
-                    </div>
-                  ))}
-                </div>
+                    );
+                  })}
+                </>
               )}
             </div>
           </div>
@@ -1088,10 +1213,11 @@ const ManufacturingDetail = () => {
                   <div className="form-group">
                     <label>Deadline</label>
                     <input
-                      type="datetime-local"
+                      type="date"
                       className="form-control"
                       value={assignDeadline}
                       onChange={(e) => setAssignDeadline(e.target.value)}
+                      min={new Date().toISOString().split('T')[0]}
                     />
                   </div>
                   <div className="form-group">
@@ -1115,6 +1241,143 @@ const ManufacturingDetail = () => {
                     ) : (
                       <><i className="fas fa-check mr-1"></i> Assign</>
                     )}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* File Upload Modal */}
+      {showUploadModal && (
+        <div className="modal fade show" style={{ display: 'block', backgroundColor: 'rgba(0,0,0,0.5)' }}>
+          <div className="modal-dialog modal-dialog-centered">
+            <div className="modal-content">
+              <div className="modal-header bg-primary text-white">
+                <h5 className="modal-title">
+                  <i className="fas fa-upload mr-2"></i>
+                  Upload Manufacturing Files
+                </h5>
+                <button type="button" className="close text-white" onClick={() => setShowUploadModal(false)}>
+                  <span>&times;</span>
+                </button>
+              </div>
+              <div className="modal-body">
+                <div className="form-group">
+                  <label>Stage <span className="text-danger">*</span></label>
+                  <select
+                    className="form-control"
+                    value={uploadStage}
+                    onChange={(e) => setUploadStage(e.target.value)}
+                  >
+                    <option value="final">Final Product</option>
+                    <option value="qc">QC / Inspection</option>
+                    <option value="in_progress">In Progress</option>
+                  </select>
+                  <small className="text-muted">
+                    {uploadStage === 'final'
+                      ? `Files will be saved to product-images/${job.sku || 'SKU'}/Final_product/`
+                      : 'Files will be saved to production uploads'}
+                  </small>
+                </div>
+                <div className="form-group">
+                  <label>Remarks</label>
+                  <textarea
+                    className="form-control"
+                    rows="2"
+                    placeholder="Any notes about these files..."
+                    value={uploadRemarks}
+                    onChange={(e) => setUploadRemarks(e.target.value)}
+                  />
+                </div>
+                <div className="form-group">
+                  <label>Select Files <span className="text-danger">*</span></label>
+                  <input
+                    type="file"
+                    ref={fileInputRef}
+                    onChange={handleFileUpload}
+                    multiple
+                    className="form-control-file"
+                    accept=".jpg,.jpeg,.png,.gif,.webp,.mp4,.mov,.avi,.mkv,.pdf,.stl,.obj,.zip,.rar,.doc,.docx,.xls,.xlsx"
+                  />
+                  <small className="text-muted">
+                    Supported: Images, Videos, PDF, STL, ZIP, Documents (max 20 files)
+                  </small>
+                </div>
+                {uploading && (
+                  <div className="text-center py-2">
+                    <div className="spinner-border text-primary mr-2"></div>
+                    <span>Uploading files...</span>
+                  </div>
+                )}
+              </div>
+              <div className="modal-footer">
+                <button type="button" className="btn btn-secondary" onClick={() => setShowUploadModal(false)}>
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Sub-Status Change Modal */}
+      {showSubStatusModal && (
+        <div className="modal fade show" style={{ display: 'block', backgroundColor: 'rgba(0,0,0,0.5)' }}>
+          <div className="modal-dialog modal-dialog-centered">
+            <div className="modal-content">
+              <div className="modal-header bg-info text-white">
+                <h5 className="modal-title">
+                  <i className="fas fa-tasks mr-2"></i>
+                  Update Sub-Status
+                </h5>
+                <button type="button" className="close text-white" onClick={() => setShowSubStatusModal(false)}>
+                  <span>&times;</span>
+                </button>
+              </div>
+              <form onSubmit={handleSubStatusChange}>
+                <div className="modal-body">
+                  <div className="form-group">
+                    <label>Current Status</label>
+                    <p>
+                      <span className={`badge badge-${getStatusBadge(job.status)}`}>
+                        {getStatusText(job.status)}
+                      </span>
+                      {job.subStatus && (
+                        <span className="badge badge-outline-primary border ml-2">{job.subStatus}</span>
+                      )}
+                    </p>
+                  </div>
+                  <div className="form-group">
+                    <label>New Sub-Status <span className="text-danger">*</span></label>
+                    <select
+                      className="form-control"
+                      value={newSubStatus}
+                      onChange={(e) => setNewSubStatus(e.target.value)}
+                      required
+                    >
+                      <option value="">Select Sub-Status</option>
+                      {(subStatusOptions[job.status] || []).map(opt => (
+                        <option key={opt} value={opt}>{opt}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="form-group">
+                    <label>Remarks</label>
+                    <textarea
+                      className="form-control"
+                      rows="2"
+                      placeholder="Optional remarks..."
+                      value={subStatusRemarks}
+                      onChange={(e) => setSubStatusRemarks(e.target.value)}
+                    />
+                  </div>
+                </div>
+                <div className="modal-footer">
+                  <button type="button" className="btn btn-secondary" onClick={() => setShowSubStatusModal(false)}>Cancel</button>
+                  <button type="submit" className="btn btn-info" disabled={submitting}>
+                    {submitting ? <><span className="spinner-border spinner-border-sm mr-1"></span> Updating...</> : <><i className="fas fa-check mr-1"></i> Update</>}
                   </button>
                 </div>
               </form>

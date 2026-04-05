@@ -1,4 +1,4 @@
-const { MarketplaceOrder, MarketplaceOrderItem, Job, AuditLog, SkuMaster, SyncLog, SystemSettings, User, Role } = require('../models');
+const { MarketplaceOrder, MarketplaceOrderItem, Job, AuditLog, SkuMaster, SyncLog, SystemSettings, User, Role, ProductionFile } = require('../models');
 const amazonService = require('../services/amazon.service');
 const ebayService = require('../services/ebay.service');
 const path = require('path');
@@ -27,7 +27,7 @@ async function getProductionCoordinators() {
   }).select('_id name email');
 }
 
-// Get all orders
+// Get all orders (optimized with batch lookups and DB-level pagination)
 exports.getOrders = async (req, res) => {
   try {
     const {
@@ -46,23 +46,50 @@ exports.getOrders = async (req, res) => {
 
     const query = {};
 
+    // Exclude soft-deleted orders by default
+    query.isDeleted = { $ne: true };
+
     if (channel && channel !== 'all' && channel !== '') query.channel = channel;
     if (status && status !== 'all' && status !== '') query.status = status;
     if (accountCode && accountCode !== 'all' && accountCode !== '') query.accountCode = accountCode;
 
+    // CAD status filter - use stored cadSummary.status (already indexed)
+    if (cadStatus && cadStatus !== 'all' && cadStatus !== '') {
+      if (cadStatus === 'has_cad') query['cadSummary.status'] = 'all_cad';
+      else if (cadStatus === 'no_cad') query['cadSummary.status'] = 'no_cad';
+      else if (cadStatus === 'partial') query['cadSummary.status'] = 'partial';
+    }
+
+    // Search handling
     if (search && search.trim() !== '') {
+      const searchTerm = search.trim();
+
+      // Find orders matching SKU or product name in items collection
+      const orderIdsFromItems = await MarketplaceOrderItem.find({
+        $or: [
+          { sku: { $regex: searchTerm, $options: 'i' } },
+          { productName: { $regex: searchTerm, $options: 'i' } }
+        ]
+      }).distinct('order');
+
       query.$or = [
-        { externalOrderId: { $regex: search.trim(), $options: 'i' } },
-        { buyerName: { $regex: search.trim(), $options: 'i' } },
-        { buyerEmail: { $regex: search.trim(), $options: 'i' } }
+        { externalOrderId: { $regex: searchTerm, $options: 'i' } },
+        { marketplaceOrderId: { $regex: searchTerm, $options: 'i' } },
+        { buyerName: { $regex: searchTerm, $options: 'i' } },
+        { buyerEmail: { $regex: searchTerm, $options: 'i' } },
+        { customerName: { $regex: searchTerm, $options: 'i' } },
+        { orderNumber: { $regex: searchTerm, $options: 'i' } }
       ];
+
+      if (orderIdsFromItems.length > 0) {
+        query.$or.push({ _id: { $in: orderIdsFromItems } });
+      }
     }
 
     if (startDate || endDate) {
       query.orderDate = {};
       if (startDate) query.orderDate.$gte = new Date(startDate);
       if (endDate) {
-        // Set end date to end of day
         const endOfDay = new Date(endDate);
         endOfDay.setHours(23, 59, 59, 999);
         query.orderDate.$lte = endOfDay;
@@ -75,23 +102,76 @@ exports.getOrders = async (req, res) => {
     if (validSortFields.includes(sortField)) {
       sortObj[sortField] = sortDirection === 'asc' ? 1 : -1;
     } else {
-      sortObj.orderDate = -1; // Default sort
+      sortObj.orderDate = -1;
     }
 
-    // Get all matching orders first (for CAD status filtering, we need to compute it)
-    let allOrders = await MarketplaceOrder.find(query)
-      .populate('marketplaceAccount', 'name accountCode')
-      .sort(sortObj)
-      .lean();
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
 
-    // Fetch items, jobs and compute CAD status for each order
-    for (const order of allOrders) {
-      const items = await MarketplaceOrderItem.find({ order: order._id }).lean();
+    // Get total count and paginated orders in parallel
+    const [total, paginatedOrders] = await Promise.all([
+      MarketplaceOrder.countDocuments(query),
+      MarketplaceOrder.find(query)
+        .populate('marketplaceAccount', 'name accountCode')
+        .sort(sortObj)
+        .skip((pageNum - 1) * limitNum)
+        .limit(limitNum)
+        .lean()
+    ]);
 
-      // Enrich items with current SKU Master CAD status
+    if (paginatedOrders.length === 0) {
+      return res.json({
+        success: true,
+        data: {
+          orders: [],
+          pagination: { total, page: pageNum, limit: limitNum, pages: Math.ceil(total / limitNum) }
+        }
+      });
+    }
+
+    const orderIds = paginatedOrders.map(o => o._id);
+
+    // Batch fetch items, jobs for only the paginated orders
+    const [allItems, allJobs] = await Promise.all([
+      MarketplaceOrderItem.find({ order: { $in: orderIds } }).lean(),
+      Job.find({ order: { $in: orderIds } })
+        .populate('cadDesigner', 'name email')
+        .populate('manufacturer', 'name email')
+        .populate('admin', 'name email')
+        .lean()
+    ]);
+
+    // Batch fetch SKU master records for all unique SKUs in items
+    const uniqueSkus = [...new Set(allItems.filter(i => i.sku).map(i => i.sku.toUpperCase()))];
+    const skuMasterRecords = uniqueSkus.length > 0
+      ? await SkuMaster.find({ sku: { $in: uniqueSkus }, isActive: true }).lean()
+      : [];
+    const skuMasterMap = new Map(skuMasterRecords.map(s => [s.sku, s]));
+
+    // Group items and jobs by order ID
+    const itemsByOrder = new Map();
+    for (const item of allItems) {
+      const orderId = item.order.toString();
+      if (!itemsByOrder.has(orderId)) itemsByOrder.set(orderId, []);
+      itemsByOrder.get(orderId).push(item);
+    }
+
+    const jobsByOrder = new Map();
+    for (const job of allJobs) {
+      const orderId = job.order.toString();
+      if (!jobsByOrder.has(orderId)) jobsByOrder.set(orderId, []);
+      jobsByOrder.get(orderId).push(job);
+    }
+
+    // Enrich each paginated order
+    for (const order of paginatedOrders) {
+      const orderId = order._id.toString();
+      const items = itemsByOrder.get(orderId) || [];
+
+      // Enrich items with SKU Master CAD status
       for (const item of items) {
         if (item.sku) {
-          const skuMaster = await SkuMaster.findOne({ sku: item.sku.toUpperCase(), isActive: true });
+          const skuMaster = skuMasterMap.get(item.sku.toUpperCase());
           if (skuMaster) {
             item.skuMasterRef = skuMaster._id;
             item.hasCadFile = skuMaster.hasCadFile || false;
@@ -115,16 +195,11 @@ exports.getOrders = async (req, res) => {
         status: itemTotal === 0 ? 'unknown' : withCad === itemTotal ? 'all_cad' : withCad === 0 ? 'no_cad' : 'partial'
       };
 
-      // Fetch job assignments for this order
-      const jobs = await Job.find({ order: order._id })
-        .populate('cadDesigner', 'name email')
-        .populate('manufacturer', 'name email')
-        .populate('admin', 'name email')
-        .lean();
-
+      // Attach jobs and assignments
+      const jobs = jobsByOrder.get(orderId) || [];
       order.jobs = jobs;
+      order.jobCount = jobs.length;
 
-      // Aggregate assignment info from jobs
       order.assignments = {
         cadDesigner: null,
         manufacturer: null,
@@ -132,45 +207,19 @@ exports.getOrders = async (req, res) => {
       };
 
       if (jobs.length > 0) {
-        // Get the first assigned user for each role (or could aggregate differently)
-        const cadDesigners = jobs.filter(j => j.cadDesigner).map(j => j.cadDesigner);
-        const manufacturers = jobs.filter(j => j.manufacturer).map(j => j.manufacturer);
-        const admins = jobs.filter(j => j.admin).map(j => j.admin);
-
-        if (cadDesigners.length > 0) {
-          order.assignments.cadDesigner = cadDesigners[0];
-        }
-        if (manufacturers.length > 0) {
-          order.assignments.manufacturer = manufacturers[0];
-        }
-        if (admins.length > 0) {
-          order.assignments.admin = admins[0];
-        }
+        const cadDesigner = jobs.find(j => j.cadDesigner)?.cadDesigner;
+        const manufacturer = jobs.find(j => j.manufacturer)?.manufacturer;
+        const admin = jobs.find(j => j.admin)?.admin;
+        if (cadDesigner) order.assignments.cadDesigner = cadDesigner;
+        if (manufacturer) order.assignments.manufacturer = manufacturer;
+        if (admin) order.assignments.admin = admin;
       }
-      order.jobCount = jobs.length;
     }
-
-    // Apply CAD status filter (after computing)
-    if (cadStatus && cadStatus !== 'all' && cadStatus !== '') {
-      allOrders = allOrders.filter(order => {
-        if (cadStatus === 'has_cad') return order.cadSummary?.status === 'all_cad';
-        if (cadStatus === 'no_cad') return order.cadSummary?.status === 'no_cad';
-        if (cadStatus === 'partial') return order.cadSummary?.status === 'partial';
-        return true;
-      });
-    }
-
-    // Apply pagination after filtering
-    const total = allOrders.length;
-    const pageNum = parseInt(page);
-    const limitNum = parseInt(limit);
-    const startIndex = (pageNum - 1) * limitNum;
-    const orders = allOrders.slice(startIndex, startIndex + limitNum);
 
     res.json({
       success: true,
       data: {
-        orders,
+        orders: paginatedOrders,
         pagination: {
           total,
           page: pageNum,
@@ -202,7 +251,7 @@ exports.getOrder = async (req, res) => {
 
     const items = await MarketplaceOrderItem.find({ order: order._id }).lean();
 
-    // Enrich items with current SKU Master CAD status
+    // Enrich items with current SKU Master CAD status and product images
     for (const item of items) {
       if (item.sku) {
         const skuMaster = await SkuMaster.findOne({ sku: item.sku.toUpperCase(), isActive: true });
@@ -211,24 +260,99 @@ exports.getOrder = async (req, res) => {
           item.hasCadFile = skuMaster.hasCadFile || false;
           item.cadFilePath = skuMaster.cadFile?.filePath || null;
           item.cadFileName = skuMaster.cadFile?.fileName || null;
+          // Include product images from SKU Master
+          item.productImages = skuMaster.images || [];
         } else {
           item.hasCadFile = false;
           item.cadFilePath = null;
           item.cadFileName = null;
+          item.productImages = [];
         }
+      } else {
+        item.productImages = [];
       }
     }
 
     const jobs = await Job.find({ order: order._id })
       .populate('cadDesigner', 'name email')
-      .populate('manufacturer', 'name email');
+      .populate('manufacturer', 'name email')
+      .lean();
+
+    // Enrich jobs with CAD file info from SKU Master if not already set on job
+    for (const job of jobs) {
+      if (!job.cadFilePath && job.sku) {
+        const skuMaster = await SkuMaster.findOne({ sku: job.sku.toUpperCase(), isActive: true });
+        if (skuMaster && skuMaster.cadFile?.filePath) {
+          job.cadFilePath = skuMaster.cadFile.filePath;
+          job.hasCadFile = true;
+        }
+      }
+    }
+
+    // Compute CAD summary for the order
+    const itemTotal = items.length;
+    const withCad = items.filter(item => item.hasCadFile).length;
+    order.cadSummary = {
+      total: itemTotal,
+      withCad: withCad,
+      withoutCad: itemTotal - withCad,
+      status: itemTotal === 0 ? 'unknown' : withCad === itemTotal ? 'all_cad' : withCad === 0 ? 'no_cad' : 'partial'
+    };
+
+    // Compute current job status summary
+    if (jobs.length > 0) {
+      const jobStatuses = jobs.map(j => j.status);
+      const statusCounts = {};
+      jobStatuses.forEach(s => { statusCounts[s] = (statusCounts[s] || 0) + 1; });
+      order.jobStatusSummary = statusCounts;
+
+      // Get the "most advanced" job status to show current workflow stage
+      const statusOrder = [
+        'new', 'cad_assigned', 'cad_in_progress', 'cad_submitted', 'cad_approved', 'cad_rejected',
+        'components_issued', 'manufacturing_assigned', 'manufacturing_accepted', 'manufacturing_in_progress',
+        'manufacturing_ready_qc', 'manufacturing_ready_delivery', 'ready_for_pickup', 'shipped', 'delivered', 'cancelled'
+      ];
+      let maxStatusIndex = -1;
+      let currentStatus = 'new';
+      jobs.forEach(job => {
+        const idx = statusOrder.indexOf(job.status);
+        if (idx > maxStatusIndex) {
+          maxStatusIndex = idx;
+          currentStatus = job.status;
+        }
+      });
+      order.currentJobStatus = currentStatus;
+    }
+
+    // Fetch manufacturing/production files for all related jobs
+    const jobIds = jobs.map(j => j._id);
+    const productionFiles = jobIds.length > 0
+      ? await ProductionFile.find({ job: { $in: jobIds } })
+          .populate('uploadedBy', 'name email')
+          .sort({ uploadedAt: -1 })
+          .lean()
+      : [];
+
+    // Group production files by job ID
+    const filesByJob = {};
+    for (const file of productionFiles) {
+      const jid = file.job.toString();
+      if (!filesByJob[jid]) filesByJob[jid] = [];
+      filesByJob[jid].push(file);
+    }
+
+    // Attach files to each job
+    for (const job of jobs) {
+      job.productionFiles = filesByJob[job._id.toString()] || [];
+    }
 
     res.json({
       success: true,
       data: {
         order,
         items,
-        jobs
+        jobs,
+        productionFiles
       }
     });
   } catch (error) {
@@ -507,8 +631,10 @@ async function importOrdersFromPython(orders, userId) {
   let skipped = 0;
   let jobsCreated = 0;
   let cadAssignedCount = 0;
+  let imagesFetched = 0;
   const errors = [];
   const missingSKUs = []; // Track SKUs not in SKU Master
+  const itemsToFetchImages = []; // Track items that need images fetched
 
   // Fetch roles and users for auto-assignment
   const designerRole = await Role.findOne({ name: 'designer' });
@@ -571,6 +697,57 @@ async function importOrdersFromPython(orders, userId) {
           hasCadFile: skuStatus.hasCadFile,
           cadFilePath: skuStatus.cadFilePath
         });
+
+        // Process image from Python script if available
+        if (itemData.localImagePath && normalizedSku) {
+          // Python already downloaded the image, update SKU Master
+          try {
+            let skuMaster = await SkuMaster.findOne({ sku: normalizedSku });
+            if (skuMaster) {
+              // Add image if not already exists
+              const existingImage = skuMaster.images?.find(img => img.filePath === itemData.localImagePath);
+              if (!existingImage) {
+                const fileName = itemData.localImagePath.split('/').pop();
+                skuMaster.images = skuMaster.images || [];
+                skuMaster.images.push({
+                  fileName,
+                  filePath: itemData.localImagePath,
+                  uploadedAt: new Date(),
+                  source: 'amazon'
+                });
+                await skuMaster.save();
+                imagesFetched++;
+                console.log(`[Image] Added Python-downloaded image to SKU Master for ${normalizedSku}`);
+              }
+            } else {
+              // Create SKU Master with image
+              const fileName = itemData.localImagePath.split('/').pop();
+              await SkuMaster.create({
+                sku: normalizedSku,
+                productName: itemData.productName || `Amazon Product ${itemData.asin}`,
+                images: [{
+                  fileName,
+                  filePath: itemData.localImagePath,
+                  uploadedAt: new Date(),
+                  source: 'amazon'
+                }],
+                isActive: true
+              });
+              imagesFetched++;
+              console.log(`[Image] Created SKU Master with Python-downloaded image for ${normalizedSku}`);
+            }
+          } catch (imgErr) {
+            console.error(`[Image] Error saving Python image for ${normalizedSku}:`, imgErr.message);
+          }
+        } else if (itemData.asin && normalizedSku) {
+          // Queue for image fetching via Node.js if Python didn't download
+          itemsToFetchImages.push({
+            asin: itemData.asin,
+            sku: normalizedSku,
+            productName: itemData.productName,
+            accountCode: orderData.accountCode
+          });
+        }
 
         // Create job for this item
         const year = new Date().getFullYear();
@@ -635,17 +812,118 @@ async function importOrdersFromPython(orders, userId) {
     }
   }
 
+  // Fetch product images for all new items (after order import)
+  if (itemsToFetchImages.length > 0) {
+    console.log(`[Image Fetch] Fetching product images for ${itemsToFetchImages.length} items...`);
+
+    // Check if auto-fetch images is enabled
+    const autoFetchImages = await SystemSettings.getSetting('amazon_auto_fetch_images');
+
+    if (autoFetchImages !== false && autoFetchImages !== 'false') {
+      // Group items by SKU to avoid duplicate fetches
+      const uniqueSkus = new Map();
+      for (const item of itemsToFetchImages) {
+        if (!uniqueSkus.has(item.sku)) {
+          uniqueSkus.set(item.sku, item);
+        }
+      }
+
+      for (const [sku, item] of uniqueSkus) {
+        try {
+          // Check if SKU Master already has images
+          const existingSkuMaster = await SkuMaster.findOne({ sku: sku.toUpperCase() });
+          if (existingSkuMaster?.images?.length > 0) {
+            console.log(`[Image Fetch] SKU ${sku} already has ${existingSkuMaster.images.length} images, skipping`);
+            continue;
+          }
+
+          // Get credentials for this account
+          const credentials = amazonService.getCredentialsFromEnv(item.accountCode || 'CSP');
+          if (!credentials.refreshToken) {
+            console.log(`[Image Fetch] No credentials for account ${item.accountCode}, skipping image fetch`);
+            continue;
+          }
+
+          // Fetch and download images from Amazon
+          console.log(`[Image Fetch] Attempting to fetch images for ASIN ${item.asin}, SKU ${sku}`);
+          const imageResult = await amazonService.downloadProductImages(
+            item.asin,
+            sku,
+            credentials,
+            item.accountCode
+          );
+
+          console.log(`[Image Fetch] Result for ${sku}:`, JSON.stringify({
+            success: imageResult.success,
+            message: imageResult.message,
+            imageCount: imageResult.images?.length || 0
+          }));
+
+          if (imageResult.success && imageResult.images?.length > 0) {
+            // Re-query SKU Master as it might have been created during order import
+            const currentSkuMaster = await SkuMaster.findOne({ sku: sku.toUpperCase() });
+
+            const newImages = imageResult.images.map(img => ({
+              fileName: img.fileName,
+              filePath: img.filePath,
+              uploadedAt: new Date(),
+              source: 'amazon'
+            }));
+
+            if (currentSkuMaster) {
+              // Update existing SKU Master with images
+              currentSkuMaster.images = [...(currentSkuMaster.images || []), ...newImages];
+              await currentSkuMaster.save();
+              imagesFetched += imageResult.images.length;
+              console.log(`[Image Fetch] Added ${imageResult.images.length} images to SKU Master for ${sku}`);
+            } else {
+              // Create SKU Master entry if it doesn't exist (with images)
+              try {
+                await SkuMaster.create({
+                  sku: sku.toUpperCase(),
+                  productName: item.productName || `Amazon Product ${item.asin}`,
+                  images: newImages,
+                  isActive: true
+                });
+                imagesFetched += imageResult.images.length;
+                console.log(`[Image Fetch] Created SKU Master for ${sku} with ${imageResult.images.length} images`);
+              } catch (skuErr) {
+                // SKU Master might have been created in parallel, try to update instead
+                if (skuErr.code === 11000) {
+                  const existingSku = await SkuMaster.findOne({ sku: sku.toUpperCase() });
+                  if (existingSku && (!existingSku.images || existingSku.images.length === 0)) {
+                    existingSku.images = newImages;
+                    await existingSku.save();
+                    imagesFetched += imageResult.images.length;
+                    console.log(`[Image Fetch] Updated existing SKU Master for ${sku} with ${imageResult.images.length} images`);
+                  }
+                } else {
+                  throw skuErr;
+                }
+              }
+            }
+          }
+        } catch (imgErr) {
+          console.error(`[Image Fetch] Error fetching images for ASIN ${item.asin}:`, imgErr.message);
+        }
+      }
+    } else {
+      console.log('[Image Fetch] Auto-fetch images is disabled in settings');
+    }
+  }
+
   // Send batch notification to Admin
   if (imported > 0) {
     try {
       const notificationService = require('../services/notification.service');
       const summaryMessage = `📈 Sync Summary [${new Date().toLocaleString()}]
-      
+
 Total Sync: ${orders.length}
 Imported: ${imported}
 Skipped (Existing): ${skipped}
 Jobs Created: ${jobsCreated}
 Auto-Assigned to CAD: ${cadAssignedCount}
+Images Fetched: ${imagesFetched}
 Missing SKUs: ${missingSKUs.length}
 
 Check the dashboard for details.`;
@@ -661,6 +939,7 @@ Check the dashboard for details.`;
     skipped,
     jobsCreated,
     cadAssignedCount,
+    imagesFetched,
     errors: errors.length,
     total: orders.length,
     missingSKUs // Return SKUs not found in SKU Master
@@ -673,11 +952,11 @@ exports.syncEbay = async (req, res) => {
   try {
     const { fromDate, toDate, accountCode, importAll } = req.body || {};
 
-    // Calculate date range
-    const startDate = fromDate ? new Date(fromDate) : new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-    const endDate = toDate ? new Date(toDate) : new Date();
+    // Calculate date range - use user-provided dates (from date picker)
+    const startDate = fromDate ? new Date(fromDate) : null;
+    const endDate = toDate ? new Date(toDate) : null;
 
-    console.log(`Syncing eBay orders from ${startDate.toISOString()} to ${endDate.toISOString()} (Account: ${accountCode || 'All'}, ImportAll: ${!!importAll})`);
+    console.log(`Syncing eBay orders from ${startDate?.toISOString() || 'default'} to ${endDate?.toISOString() || 'default'} (Account: ${accountCode || 'All'}, ImportAll: ${!!importAll})`);
 
     // Create sync log entry
     syncLog = await SyncLog.startSync({
@@ -689,18 +968,40 @@ exports.syncEbay = async (req, res) => {
     });
 
     let result;
-    if (accountCode) {
+    if (accountCode && accountCode !== 'all') {
       // Sync specific account
       const MarketplaceAccount = require('../models/MarketplaceAccount');
       const account = await MarketplaceAccount.findOne({ accountCode, channel: 'ebay' });
       if (!account) {
-        throw new Error(`eBay account with code ${accountCode} not found`);
+        // Check if the account exists but for a different channel (e.g., Amazon)
+        const otherAccount = await MarketplaceAccount.findOne({ accountCode });
+        if (otherAccount) {
+          return res.status(400).json({
+            success: false,
+            message: `Account "${accountCode}" is configured for ${otherAccount.channel}, not eBay. Please select "All Activated Accounts" or configure eBay credentials for this account.`
+          });
+        }
+        return res.status(404).json({
+          success: false,
+          message: `eBay account with code "${accountCode}" not found. Please configure it in Settings or select "All Activated Accounts".`
+        });
       }
-      const credentials = await account.getDecryptedCredentials();
+      let credentials = await account.getDecryptedCredentials();
+
+      // If DB credentials are empty (auto-created account), try env credentials
+      if (!credentials || !credentials.appId || !credentials.certId) {
+        // Try matching env account: CSP_EBAY -> CSP, or direct match
+        const envCode = accountCode.replace(/_EBAY$/, '');
+        const envCreds = ebayService.getCredentialsFromEnv(envCode);
+        if (envCreds.appId && envCreds.certId && envCreds.refreshToken) {
+          credentials = envCreds;
+        }
+      }
+
       result = await ebayService.fetchOrdersForAccount(account, credentials, startDate, endDate, importAll);
     } else {
-      // Sync all accounts
-      result = await ebayService.fetchOrders(startDate, endDate, importAll);
+      // Sync all eBay accounts (multi-account like Amazon)
+      result = await ebayService.fetchOrdersFromAllAccounts(startDate, endDate, importAll);
     }
 
     // Update sync log
@@ -735,11 +1036,17 @@ exports.syncEbay = async (req, res) => {
     if (syncLog) {
       await syncLog.complete('failed', {}, error.message);
     }
-    res.status(500).json({
+
+    // Return troubleshooting info for token errors
+    const responseData = {
       success: false,
       message: 'Failed to sync eBay orders',
       error: error.message
-    });
+    };
+    if (error.troubleshooting) {
+      responseData.troubleshooting = error.troubleshooting;
+    }
+    res.status(500).json(responseData);
   }
 };
 
@@ -1482,17 +1789,21 @@ exports.assignUser = async (req, res) => {
       if (admins.length > 0) assignments.admin = admins[0];
     }
 
-    // Log the action
-    await AuditLog.log({
-      user: req.userId,
-      action: 'assign_user',
-      entity: 'order',
-      entityId: id,
-      description: `Assigned ${assignType} to order ${order.externalOrderId}`,
-      newValues: { assignType, userId, jobsUpdated, jobsCreated },
-      ipAddress: req.ip,
-      userAgent: req.get('User-Agent')
-    });
+    // Log the action (don't fail the operation if audit logging fails)
+    try {
+      await AuditLog.log({
+        user: req.userId,
+        action: 'assign_user',
+        entity: 'order',
+        entityId: id,
+        description: `Assigned ${assignType} to order ${order.externalOrderId}`,
+        newValues: { assignType, userId, jobsUpdated, jobsCreated },
+        ipAddress: req.ip,
+        userAgent: req.get('User-Agent')
+      });
+    } catch (logError) {
+      console.error('Audit log error (non-fatal):', logError);
+    }
 
     res.json({
       success: true,
@@ -1508,7 +1819,7 @@ exports.assignUser = async (req, res) => {
     console.error('Assign user error:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to assign user to order'
+      message: error.message || 'Failed to assign user to order'
     });
   }
 };
@@ -1644,6 +1955,121 @@ exports.uploadOrderImages = async (req, res) => {
   }
 };
 
+// Delete order (super admin only) - supports soft and hard delete
+exports.deleteOrder = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { deleteType = 'soft' } = req.query;
+
+    const order = await MarketplaceOrder.findById(id);
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: 'Order not found'
+      });
+    }
+
+    // Get associated items and jobs for counting
+    const items = await MarketplaceOrderItem.find({ order: id });
+    const jobs = await Job.find({ order: id });
+
+    if (deleteType === 'hard') {
+      // HARD DELETE - Permanently remove everything
+
+      // Delete associated jobs and their files
+      for (const job of jobs) {
+        // Delete job-related files if any
+        if (job.cadFilePath) {
+          const cadPath = path.join(__dirname, '../../', job.cadFilePath);
+          if (fs.existsSync(cadPath)) {
+            fs.unlinkSync(cadPath);
+          }
+        }
+        await Job.findByIdAndDelete(job._id);
+      }
+
+      // Delete order items
+      await MarketplaceOrderItem.deleteMany({ order: id });
+
+      // Delete order images if any
+      if (order.images && order.images.length > 0) {
+        for (const img of order.images) {
+          const imgPath = path.join(__dirname, '../../', img.filePath);
+          if (fs.existsSync(imgPath)) {
+            fs.unlinkSync(imgPath);
+          }
+        }
+      }
+
+      // Permanently delete the order
+      await MarketplaceOrder.findByIdAndDelete(id);
+
+      // Audit log
+      await AuditLog.log({
+        user: req.userId,
+        action: 'hard_delete',
+        entity: 'order',
+        entityId: id,
+        description: `Permanently deleted order ${order.externalOrderId || order.marketplaceOrderId || id} and ${jobs.length} jobs, ${items.length} items`,
+        oldValues: {
+          order: order.toObject(),
+          itemCount: items.length,
+          jobCount: jobs.length
+        },
+        ipAddress: req.ip,
+        userAgent: req.get('User-Agent')
+      });
+
+      res.json({
+        success: true,
+        message: `Order permanently deleted. Removed ${jobs.length} jobs and ${items.length} items.`
+      });
+    } else {
+      // SOFT DELETE - Mark as deleted but keep data
+
+      // Mark order as deleted
+      order.isDeleted = true;
+      order.deletedAt = new Date();
+      order.deletedBy = req.userId;
+      await order.save();
+
+      // Mark associated jobs as cancelled
+      await Job.updateMany(
+        { order: id },
+        {
+          status: 'cancelled',
+          cancelledAt: new Date(),
+          cancelReason: 'Order soft deleted by admin'
+        }
+      );
+
+      // Audit log
+      await AuditLog.log({
+        user: req.userId,
+        action: 'soft_delete',
+        entity: 'order',
+        entityId: id,
+        description: `Soft deleted order ${order.externalOrderId || order.marketplaceOrderId || id} (moved to trash)`,
+        oldValues: { isDeleted: false },
+        newValues: { isDeleted: true, deletedAt: order.deletedAt },
+        ipAddress: req.ip,
+        userAgent: req.get('User-Agent')
+      });
+
+      res.json({
+        success: true,
+        message: `Order moved to trash. ${jobs.length} job(s) cancelled.`
+      });
+    }
+  } catch (error) {
+    console.error('Delete order error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to delete order'
+    });
+  }
+};
+
 // Delete order image
 exports.deleteOrderImage = async (req, res) => {
   try {
@@ -1701,58 +2127,85 @@ exports.deleteOrderImage = async (req, res) => {
   }
 };
 
-// Fetch product images from Amazon
+// Fetch product images from Amazon or eBay
 exports.fetchProductImages = async (req, res) => {
   try {
-    const { asin, sku, accountCode } = req.body;
+    const { asin, sku, accountCode, channel, itemId } = req.body;
 
-    if (!asin) {
+    // Validate input - need either ASIN (Amazon) or itemId (eBay)
+    if (!asin && !itemId) {
       return res.status(400).json({
         success: false,
-        message: 'ASIN is required'
+        message: 'ASIN (for Amazon) or itemId (for eBay) is required'
       });
     }
 
-    // Determine which account credentials to use
-    let credentials = null;
-    let useAccountCode = accountCode || 'CSP'; // Default to CSP account
-
-    // If SKU provided, try to find the order and get its account code
-    if (sku && !accountCode) {
-      const orderItem = await MarketplaceOrderItem.findOne({
-        $or: [
-          { sku: sku },
-          { sku: sku.toUpperCase() },
-          { asinOrItemId: asin }
-        ]
-      }).populate('order');
-
-      if (orderItem?.order?.accountCode) {
-        useAccountCode = orderItem.order.accountCode;
+    // Determine channel from input or try to detect
+    let useChannel = channel;
+    if (!useChannel) {
+      // If itemId provided but no asin, assume eBay
+      if (itemId && !asin) {
+        useChannel = 'ebay';
+      } else {
+        // Default to Amazon for ASIN
+        useChannel = 'amazon';
       }
     }
 
-    // Get credentials from .env based on account code
-    credentials = amazonService.getCredentialsFromEnv(useAccountCode);
+    let result;
+    let source;
 
-    // Check if we have valid credentials
-    if (!credentials.refreshToken || !credentials.clientId || !credentials.clientSecret) {
-      // Try CSP as fallback
-      credentials = amazonService.getCredentialsFromEnv('CSP');
-      useAccountCode = 'CSP';
+    if (useChannel === 'ebay') {
+      // eBay image fetch
+      const legacyItemId = itemId || asin; // itemId is primary, asin might contain legacy ID
+      console.log(`Fetching eBay product images for item ${legacyItemId}`);
 
+      result = await ebayService.downloadProductImages(legacyItemId, sku || legacyItemId);
+      source = 'ebay';
+
+    } else {
+      // Amazon image fetch (default)
+      let credentials = null;
+      let useAccountCode = accountCode || 'CSP'; // Default to CSP account
+
+      // If SKU provided, try to find the order and get its account code
+      if (sku && !accountCode) {
+        const orderItem = await MarketplaceOrderItem.findOne({
+          $or: [
+            { sku: sku },
+            { sku: sku.toUpperCase() },
+            { asinOrItemId: asin }
+          ]
+        }).populate('order');
+
+        if (orderItem?.order?.accountCode) {
+          useAccountCode = orderItem.order.accountCode;
+        }
+      }
+
+      // Get credentials from .env based on account code
+      credentials = amazonService.getCredentialsFromEnv(useAccountCode);
+
+      // Check if we have valid credentials
       if (!credentials.refreshToken || !credentials.clientId || !credentials.clientSecret) {
-        return res.status(400).json({
-          success: false,
-          message: 'Amazon credentials not configured. Please configure CSP_AMAZON credentials in .env file.'
-        });
+        // Try CSP as fallback
+        credentials = amazonService.getCredentialsFromEnv('CSP');
+        useAccountCode = 'CSP';
+
+        if (!credentials.refreshToken || !credentials.clientId || !credentials.clientSecret) {
+          return res.status(400).json({
+            success: false,
+            message: 'Amazon credentials not configured. Please configure CSP_AMAZON credentials in .env file.'
+          });
+        }
       }
+
+      console.log(`Fetching Amazon product images for ASIN ${asin} using account: ${useAccountCode}`);
+
+      // Download images from Amazon with proper credentials
+      result = await amazonService.downloadProductImages(asin, sku || asin, credentials, useAccountCode);
+      source = 'amazon';
     }
-
-    console.log(`Fetching product images for ASIN ${asin} using account: ${useAccountCode}`);
-
-    // Download images from Amazon with proper credentials
-    const result = await amazonService.downloadProductImages(asin, sku || asin, credentials, useAccountCode);
 
     if (!result.success) {
       return res.status(400).json({
@@ -1770,7 +2223,7 @@ exports.fetchProductImages = async (req, res) => {
           fileName: img.fileName,
           filePath: img.filePath,
           uploadedAt: new Date(),
-          source: 'amazon'
+          source: source
         }));
 
         skuMaster.images = [...(skuMaster.images || []), ...newImages];
@@ -1778,19 +2231,20 @@ exports.fetchProductImages = async (req, res) => {
       }
     }
 
+    const identifier = source === 'ebay' ? (itemId || asin) : asin;
     await AuditLog.log({
       user: req.userId,
       action: 'fetch_images',
       entity: 'product',
-      description: `Fetched ${result.downloadedCount} product images for ASIN ${asin}`,
-      metadata: { asin, sku, imageCount: result.downloadedCount },
+      description: `Fetched ${result.downloadedCount} product images for ${source.toUpperCase()} ${identifier}`,
+      metadata: { asin, itemId, sku, imageCount: result.downloadedCount, source },
       ipAddress: req.ip,
       userAgent: req.get('User-Agent')
     });
 
     res.json({
       success: true,
-      message: `Downloaded ${result.downloadedCount} images`,
+      message: `Downloaded ${result.downloadedCount} images from ${source.toUpperCase()}`,
       data: result
     });
 

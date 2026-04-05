@@ -54,8 +54,11 @@ router.use(verifyToken);
 // Routes
 router.get('/', jobController.getJobs);
 router.get('/statistics', adminOrAbove, jobController.getStatistics);
+router.get('/sub-status-options', jobController.getSubStatusOptions);
 router.get('/:id', jobController.getJob);
 router.get('/:id/history', jobController.getStatusHistory);
+router.get('/:id/download-images', jobController.downloadProductImagesZip);
+router.put('/:id/sub-status', jobController.updateSubStatus);
 router.post('/', adminOrAbove, createJobValidation, validate, jobController.createJob);
 router.put('/:id', adminOrAbove, updateJobValidation, validate, jobController.updateJob);
 router.put('/:id/status', updateStatusValidation, validate, jobController.updateStatus);

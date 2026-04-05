@@ -1,0 +1,46 @@
+Docker (current setup)                                              
+  # Start all services 
+  cd D:/devlopment/sap_data_p && docker-compose up -d
+  # Restart all services 
+  cd D:/devlopment/sap_data_p && docker-compose restart            
+                                                                   
+  # Stop all services
+  cd D:/devlopment/sap_data_p && docker-compose down
+
+  # View logs
+  cd D:/devlopment/sap_data_p && docker-compose logs -f backend    
+  cd D:/devlopment/sap_data_p && docker-compose logs -f frontend   
+
+  Local (without Docker)
+
+  # Backend
+  cd D:/devlopment/sap_data_p/backend && npm run dev
+
+  # Frontend (separate terminal)
+  cd D:/devlopment/sap_data_p/frontend && npm start
+
+  Access URLs
+
+  ┌──────────────┬──────────────────────────────────┐
+  │   Service    │               URL                │
+  ├──────────────┼──────────────────────────────────┤
+  │ Frontend     │ http://localhost:3000            │
+  ├──────────────┼──────────────────────────────────┤
+  │ Backend API  │ http://localhost:5001/api        │
+  ├──────────────┼──────────────────────────────────┤
+  │ Health Check │ http://localhost:5001/api/health │
+  └──────────────┴──────────────────────────────────┘
+
+  Login Credentials
+
+  - Email: admin@jewellery.com
+  - Password: Admin@123
+
+
+                                                                   
+● Docker Desktop Service is Stopped. Same issue — it needs     
+  Administrator privileges to start.                               
+                                                                   
+  Open a PowerShell as Administrator (right-click Start → Terminal   (Admin)) and run:                                                
+                                                                     net start com.docker.service                                                                                                          Then start Docker Desktop:                                       
+                                                                     Start-Process "C:\Program Files\Docker\Docker\Docker Desktop.exe"                                                                     Or simply double-click Docker Desktop from your Start              menu/desktop

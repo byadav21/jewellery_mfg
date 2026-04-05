@@ -80,6 +80,18 @@ const marketplaceOrderSchema = new mongoose.Schema({
       enum: ['all_cad', 'partial', 'no_cad', 'unknown'],
       default: 'unknown'
     }
+  },
+  // Soft delete support
+  isDeleted: {
+    type: Boolean,
+    default: false
+  },
+  deletedAt: {
+    type: Date
+  },
+  deletedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
   }
 }, {
   timestamps: true
@@ -92,5 +104,6 @@ marketplaceOrderSchema.index({ orderDate: -1 });
 marketplaceOrderSchema.index({ marketplaceAccount: 1 });
 marketplaceOrderSchema.index({ accountCode: 1 });
 marketplaceOrderSchema.index({ 'cadSummary.status': 1 });
+marketplaceOrderSchema.index({ isDeleted: 1, orderDate: -1 });
 
 module.exports = mongoose.model('MarketplaceOrder', marketplaceOrderSchema);

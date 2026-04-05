@@ -13,6 +13,61 @@ const JobDetail = () => {
   const [loading, setLoading] = useState(true);
   const [job, setJob] = useState(null);
   const [submitting, setSubmitting] = useState(false);
+  const [manufacturingFiles, setManufacturingFiles] = useState([]);
+  const [downloadingZip, setDownloadingZip] = useState(false);
+  const [subStatusOptions, setSubStatusOptions] = useState({});
+  const [showSubStatusModal, setShowSubStatusModal] = useState(false);
+  const [newSubStatus, setNewSubStatus] = useState('');
+  const [subStatusRemarks, setSubStatusRemarks] = useState('');
+
+  // ZIP download helper
+  const handleDownloadZip = async (type) => {
+    try {
+      setDownloadingZip(true);
+      const response = await jobAPI.downloadImagesZip(id, type);
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', `${job.sku || job.jobCode || 'files'}_${type || 'all'}.zip`);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (error) {
+      toast.error('Failed to download ZIP');
+    } finally {
+      setDownloadingZip(false);
+    }
+  };
+
+  // Fetch sub-status options
+  useEffect(() => {
+    jobAPI.getSubStatusOptions().then(res => {
+      setSubStatusOptions(res.data.data || {});
+    }).catch(() => {});
+  }, []);
+
+  // Handle sub-status change
+  const handleSubStatusChange = async (e) => {
+    e.preventDefault();
+    if (!newSubStatus) {
+      toast.error('Please select a sub-status');
+      return;
+    }
+    try {
+      setSubmitting(true);
+      await jobAPI.updateSubStatus(id, newSubStatus, subStatusRemarks);
+      toast.success('Sub-status updated');
+      setShowSubStatusModal(false);
+      setNewSubStatus('');
+      setSubStatusRemarks('');
+      fetchJob();
+    } catch (error) {
+      toast.error(error.response?.data?.message || 'Failed to update sub-status');
+    } finally {
+      setSubmitting(false);
+    }
+  };
 
   // Status change state
   const [showStatusModal, setShowStatusModal] = useState(false);
@@ -36,6 +91,8 @@ const JobDetail = () => {
   // User role check
   const userRoles = user?.roles?.map(r => r.name || r) || [];
   const isAdmin = userRoles.includes('admin') || userRoles.includes('super_admin');
+  const isManufacturer = userRoles.includes('manufacturer');
+  const isAssignedManufacturer = user && job && job.manufacturer?._id === user._id;
 
 
   const fetchJob = useCallback(async () => {
@@ -70,9 +127,19 @@ const JobDetail = () => {
     }
   }, []);
 
+  const fetchManufacturingFiles = useCallback(async () => {
+    try {
+      const response = await manufacturingAPI.getFiles(id);
+      setManufacturingFiles(response.data.data || []);
+    } catch (error) {
+      // Silently fail - files section is optional
+    }
+  }, [id]);
+
   useEffect(() => {
     fetchJob();
-  }, [id, fetchJob]);
+    fetchManufacturingFiles();
+  }, [id, fetchJob, fetchManufacturingFiles]);
 
   useEffect(() => {
     if (isAdmin) {
@@ -277,6 +344,14 @@ const JobDetail = () => {
     'cad_submitted'
   ];
 
+  // Manufacturing statuses that manufacturers can change to
+  const manufacturerAllowedStatuses = [
+    'manufacturing_accepted',
+    'manufacturing_in_progress',
+    'manufacturing_ready_qc',
+    'manufacturing_ready_delivery'
+  ];
+
   // Check if current user is the CAD designer for this job
   const isAssignedDesigner = user && job && job.cadDesigner?._id === user._id;
   const canSubmitForReview = isAssignedDesigner &&
@@ -286,6 +361,10 @@ const JobDetail = () => {
   // Designers can change status if they are assigned and job is in CAD phase
   const designerCanChangeStatus = isAssignedDesigner &&
     ['cad_assigned', 'cad_in_progress', 'cad_rejected'].includes(job?.status);
+
+  // Manufacturers can change status if they are assigned and job is in manufacturing phase
+  const manufacturerCanChangeStatus = (isAssignedManufacturer || (isManufacturer && isAdmin)) &&
+    ['manufacturing_assigned', 'manufacturing_accepted', 'manufacturing_in_progress', 'manufacturing_ready_qc'].includes(job?.status);
 
   if (loading) {
     return (
@@ -379,6 +458,21 @@ const JobDetail = () => {
                   <i className="fas fa-exchange-alt mr-1"></i> Change CAD Status
                 </button>
               )}
+              {/* Manufacturer can change manufacturing status */}
+              {!isAdmin && manufacturerCanChangeStatus && (
+                <button
+                  className="btn btn-warning mr-2 mb-2"
+                  onClick={() => setShowStatusModal(true)}
+                >
+                  <i className="fas fa-exchange-alt mr-1"></i> Change Status
+                </button>
+              )}
+              {/* Manufacturer link to Manufacturing Detail */}
+              {(isAssignedManufacturer || (isManufacturer && isAdmin)) && (
+                <Link to={`/manufacturing/${job._id}`} className="btn btn-info mr-2 mb-2">
+                  <i className="fas fa-industry mr-1"></i> Manufacturing View
+                </Link>
+              )}
               {(isAssignedDesigner || isAdmin) && (
                 <Link to={`/cad/upload/${job._id}`} className="btn btn-primary mr-2 mb-2">
                   <i className="fas fa-upload mr-1"></i> Upload CAD Files
@@ -423,6 +517,27 @@ const JobDetail = () => {
                           <span className={`badge badge-${getStatusBadge(job.status)}`}>
                             {getStatusText(job.status)}
                           </span>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td className="text-muted">Sub-Status:</td>
+                        <td>
+                          {job.subStatus ? (
+                            <span className="badge badge-outline-primary border" style={{ fontSize: '12px' }}>
+                              {job.subStatus}
+                            </span>
+                          ) : (
+                            <span className="text-muted">-</span>
+                          )}
+                          {(isAdmin || designerCanChangeStatus || manufacturerCanChangeStatus) && subStatusOptions[job.status]?.length > 0 && (
+                            <button
+                              className="btn btn-xs btn-outline-secondary ml-2"
+                              onClick={() => { setNewSubStatus(job.subStatus || ''); setShowSubStatusModal(true); }}
+                              title="Update sub-status"
+                            >
+                              <i className="fas fa-edit"></i>
+                            </button>
+                          )}
                         </td>
                       </tr>
                       <tr>
@@ -513,9 +628,33 @@ const JobDetail = () => {
                         <td className="text-muted">Has CAD File:</td>
                         <td>
                           {job.hasCadFile ? (
-                            <span className="badge badge-success">Yes</span>
+                            <>
+                              <span className="badge badge-success">Yes</span>
+                              {job.cadFilePath && (
+                                <a
+                                  href={`${API_BASE_URL}${job.cadFilePath}`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="btn btn-success btn-xs ml-2"
+                                  download
+                                >
+                                  <i className="fas fa-download mr-1"></i> Download STL
+                                </a>
+                              )}
+                            </>
                           ) : (
                             <span className="badge badge-danger">No</span>
+                          )}
+                          {job.skuMasterCad && job.skuMasterCad.hasCadFile && !job.cadFilePath && job.skuMasterCad.cadFilePath && (
+                            <a
+                              href={`${API_BASE_URL}${job.skuMasterCad.cadFilePath}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="btn btn-success btn-xs ml-2"
+                              download
+                            >
+                              <i className="fas fa-download mr-1"></i> Download STL (SKU Master)
+                            </a>
                           )}
                         </td>
                       </tr>
@@ -671,6 +810,142 @@ const JobDetail = () => {
             </div>
           )}
 
+          {/* SKU Master Product Images */}
+          {job.skuMasterImages && job.skuMasterImages.length > 0 && (
+            <div className="card">
+              <div className="card-header d-flex justify-content-between align-items-center">
+                <h3 className="card-title mb-0">
+                  <i className="fas fa-images mr-2"></i>
+                  Product Images ({job.skuMasterImages.length})
+                </h3>
+                <button
+                  className="btn btn-sm btn-outline-success"
+                  onClick={() => handleDownloadZip('product')}
+                  disabled={downloadingZip}
+                >
+                  {downloadingZip ? (
+                    <><span className="spinner-border spinner-border-sm mr-1"></span> Zipping...</>
+                  ) : (
+                    <><i className="fas fa-file-archive mr-1"></i> Download All (ZIP)</>
+                  )}
+                </button>
+              </div>
+              <div className="card-body">
+                <div className="row">
+                  {job.skuMasterImages.map((img, index) => (
+                    <div key={img._id || index} className="col-md-2 col-sm-3 col-4 mb-3 text-center">
+                      <img
+                        src={`${API_BASE_URL}${img.filePath}`}
+                        alt={img.fileName || `Product ${index + 1}`}
+                        className="img-fluid img-thumbnail"
+                        style={{ width: '100%', height: '150px', objectFit: 'cover', cursor: 'pointer' }}
+                        onClick={() => window.open(`${API_BASE_URL}${img.filePath}`, '_blank')}
+                      />
+                      <div className="mt-1">
+                        {img.source && img.source !== 'manual' && (
+                          <small className={`badge badge-${img.source === 'amazon' ? 'warning' : 'danger'} mr-1`}>
+                            {img.source}
+                          </small>
+                        )}
+                        <a
+                          href={`${API_BASE_URL}${img.filePath}`}
+                          download={img.fileName}
+                          className="btn btn-xs btn-outline-primary"
+                          title="Download"
+                        >
+                          <i className="fas fa-download"></i>
+                        </a>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Manufacturing / Production Files */}
+          {manufacturingFiles.length > 0 && (
+            <div className="card">
+              <div className="card-header d-flex justify-content-between align-items-center">
+                <h3 className="card-title mb-0">
+                  <i className="fas fa-industry mr-2"></i>
+                  Manufacturing Files ({manufacturingFiles.length})
+                </h3>
+                <button
+                  className="btn btn-sm btn-outline-success"
+                  onClick={() => handleDownloadZip('manufacturing')}
+                  disabled={downloadingZip}
+                >
+                  {downloadingZip ? (
+                    <><span className="spinner-border spinner-border-sm mr-1"></span> Zipping...</>
+                  ) : (
+                    <><i className="fas fa-file-archive mr-1"></i> Download All (ZIP)</>
+                  )}
+                </button>
+              </div>
+              <div className="card-body">
+                {['final', 'qc', 'in_progress'].map(stage => {
+                  const stageFiles = manufacturingFiles.filter(f => (f.stage || 'final') === stage);
+                  if (stageFiles.length === 0) return null;
+                  const stageLabels = { final: 'Final Product', qc: 'QC / Inspection', in_progress: 'In Progress' };
+                  const stageColors = { final: 'success', qc: 'info', in_progress: 'warning' };
+                  return (
+                    <div key={stage} className="mb-3">
+                      <h6>
+                        <span className={`badge badge-${stageColors[stage]} mr-2`}>{stageLabels[stage]}</span>
+                        ({stageFiles.length} files)
+                      </h6>
+                      <div className="row">
+                        {stageFiles.map((file, idx) => {
+                          const filePath = file.filePath || file.path;
+                          const fileName = file.fileName || file.filename;
+                          const isImage = file.fileType === 'image' || file.mimeType?.startsWith('image/');
+                          const isVideo = file.fileType === 'video' || file.mimeType?.startsWith('video/');
+                          const isPdf = file.fileType === 'document' || file.mimeType?.includes('pdf');
+                          return (
+                            <div key={file._id || idx} className="col-md-2 col-sm-3 col-4 mb-3">
+                              <div className="card h-100">
+                                <div className="card-body text-center p-2">
+                                  {isImage ? (
+                                    <img
+                                      src={`${API_BASE_URL}${filePath}`}
+                                      alt={fileName}
+                                      className="img-fluid img-thumbnail mb-1"
+                                      style={{ maxHeight: '120px', objectFit: 'cover', cursor: 'pointer' }}
+                                      onClick={() => window.open(`${API_BASE_URL}${filePath}`, '_blank')}
+                                    />
+                                  ) : isVideo ? (
+                                    <div className="py-2" style={{ cursor: 'pointer' }} onClick={() => window.open(`${API_BASE_URL}${filePath}`, '_blank')}>
+                                      <i className="fas fa-video fa-3x text-primary"></i>
+                                    </div>
+                                  ) : (
+                                    <div className="py-2" style={{ cursor: 'pointer' }} onClick={() => window.open(`${API_BASE_URL}${filePath}`, '_blank')}>
+                                      <i className={`fas ${isPdf ? 'fa-file-pdf text-danger' : 'fa-file text-secondary'} fa-3x`}></i>
+                                    </div>
+                                  )}
+                                  <p className="small text-truncate mb-1" title={fileName}>{fileName}</p>
+                                  {file.remarks && (
+                                    <small className="text-muted d-block mb-1">{file.remarks}</small>
+                                  )}
+                                  <small className="text-muted d-block">
+                                    {file.uploadedBy?.name || ''} {file.uploadedAt ? new Date(file.uploadedAt).toLocaleDateString() : ''}
+                                  </small>
+                                  <a href={`${API_BASE_URL}${filePath}`} target="_blank" rel="noopener noreferrer" className="btn btn-xs btn-outline-primary mt-1" download>
+                                    <i className="fas fa-download"></i>
+                                  </a>
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           {/* Related Order */}
           {job.order && (
             <div className="card">
@@ -747,8 +1022,8 @@ const JobDetail = () => {
                       required
                     >
                       <option value="">Select Status</option>
-                      {/* Admins see all statuses, designers see only CAD statuses */}
-                      {(isAdmin ? allStatuses : designerAllowedStatuses)
+                      {/* Admins see all statuses, designers see CAD statuses, manufacturers see mfg statuses */}
+                      {(isAdmin ? allStatuses : manufacturerCanChangeStatus ? manufacturerAllowedStatuses : designerAllowedStatuses)
                         .filter(s => s !== job.status)
                         .map(status => (
                           <option key={status} value={status}>
@@ -757,9 +1032,14 @@ const JobDetail = () => {
                         ))
                       }
                     </select>
-                    {!isAdmin && (
+                    {!isAdmin && designerCanChangeStatus && (
                       <small className="text-muted">
                         As a designer, you can change status to "In Progress" or "Submitted"
+                      </small>
+                    )}
+                    {!isAdmin && manufacturerCanChangeStatus && (
+                      <small className="text-muted">
+                        As a manufacturer, you can update the manufacturing status
                       </small>
                     )}
                   </div>
@@ -832,10 +1112,11 @@ const JobDetail = () => {
                   <div className="form-group">
                     <label>Deadline</label>
                     <input
-                      type="datetime-local"
+                      type="date"
                       className="form-control"
                       value={cadDeadline}
                       onChange={(e) => setCadDeadline(e.target.value)}
+                      min={new Date().toISOString().split('T')[0]}
                     />
                   </div>
                   <div className="form-group">
@@ -907,10 +1188,11 @@ const JobDetail = () => {
                   <div className="form-group">
                     <label>Deadline</label>
                     <input
-                      type="datetime-local"
+                      type="date"
                       className="form-control"
                       value={mfgDeadline}
                       onChange={(e) => setMfgDeadline(e.target.value)}
+                      min={new Date().toISOString().split('T')[0]}
                     />
                   </div>
                   <div className="form-group">
@@ -934,6 +1216,70 @@ const JobDetail = () => {
                     ) : (
                       <><i className="fas fa-check mr-1"></i> Assign Manufacturer</>
                     )}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Sub-Status Change Modal */}
+      {showSubStatusModal && (
+        <div className="modal fade show" style={{ display: 'block', backgroundColor: 'rgba(0,0,0,0.5)' }}>
+          <div className="modal-dialog modal-dialog-centered">
+            <div className="modal-content">
+              <div className="modal-header bg-info text-white">
+                <h5 className="modal-title">
+                  <i className="fas fa-tasks mr-2"></i>
+                  Update Sub-Status
+                </h5>
+                <button type="button" className="close text-white" onClick={() => setShowSubStatusModal(false)}>
+                  <span>&times;</span>
+                </button>
+              </div>
+              <form onSubmit={handleSubStatusChange}>
+                <div className="modal-body">
+                  <div className="form-group">
+                    <label>Current Status</label>
+                    <p>
+                      <span className={`badge badge-${getStatusBadge(job.status)}`}>
+                        {getStatusText(job.status)}
+                      </span>
+                      {job.subStatus && (
+                        <span className="badge badge-outline-primary border ml-2">{job.subStatus}</span>
+                      )}
+                    </p>
+                  </div>
+                  <div className="form-group">
+                    <label>New Sub-Status <span className="text-danger">*</span></label>
+                    <select
+                      className="form-control"
+                      value={newSubStatus}
+                      onChange={(e) => setNewSubStatus(e.target.value)}
+                      required
+                    >
+                      <option value="">Select Sub-Status</option>
+                      {(subStatusOptions[job.status] || []).map(opt => (
+                        <option key={opt} value={opt}>{opt}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="form-group">
+                    <label>Remarks</label>
+                    <textarea
+                      className="form-control"
+                      rows="2"
+                      placeholder="Optional remarks..."
+                      value={subStatusRemarks}
+                      onChange={(e) => setSubStatusRemarks(e.target.value)}
+                    />
+                  </div>
+                </div>
+                <div className="modal-footer">
+                  <button type="button" className="btn btn-secondary" onClick={() => setShowSubStatusModal(false)}>Cancel</button>
+                  <button type="submit" className="btn btn-info" disabled={submitting}>
+                    {submitting ? <><span className="spinner-border spinner-border-sm mr-1"></span> Updating...</> : <><i className="fas fa-check mr-1"></i> Update</>}
                   </button>
                 </div>
               </form>

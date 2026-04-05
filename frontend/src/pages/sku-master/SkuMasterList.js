@@ -1,8 +1,9 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { Link } from 'react-router-dom';
 import { toast } from 'react-toastify';
 import { skuMasterAPI } from '../../services/api';
 import DataTable from '../../components/common/DataTable';
+import useDebounce from '../../hooks/useDebounce';
 
 const API_BASE_URL = process.env.REACT_APP_API_URL?.replace('/api', '') || 'http://localhost:5001';
 
@@ -67,13 +68,22 @@ const SkuMasterList = () => {
     { value: 'other', label: 'Other' }
   ];
 
+  // Debounce search input
+  const debouncedSearch = useDebounce(filters.search, 300);
+
+  // Create effective filters with debounced search
+  const effectiveFilters = useMemo(() => ({
+    ...filters,
+    search: debouncedSearch
+  }), [filters.category, filters.hasCadFile, filters.isActive, debouncedSearch]);
+
   const fetchSkus = useCallback(async () => {
     try {
       setLoading(true);
       const params = {
         page: pagination.page,
         limit: pagination.limit,
-        ...filters
+        ...effectiveFilters
       };
       const response = await skuMasterAPI.getAll(params);
       setSkus(response.data.data?.skus || []);
@@ -85,7 +95,7 @@ const SkuMasterList = () => {
     } finally {
       setLoading(false);
     }
-  }, [pagination.page, pagination.limit, filters]);
+  }, [pagination.page, pagination.limit, effectiveFilters]);
 
   const fetchStatistics = async () => {
     try {

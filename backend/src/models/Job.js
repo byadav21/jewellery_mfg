@@ -158,7 +158,18 @@ const jobSchema = new mongoose.Schema({
   },
   remarks: {
     type: String
-  }
+  },
+  // Sub-status for granular tracking within a main status
+  subStatus: {
+    type: String,
+    trim: true
+  },
+  subStatusHistory: [{
+    subStatus: String,
+    changedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    changedAt: { type: Date, default: Date.now },
+    remarks: String
+  }]
 }, {
   timestamps: true
 });
@@ -173,9 +184,10 @@ jobSchema.index({ productionCoordinator: 1 });
 jobSchema.index({ dueDate: 1 });
 jobSchema.index({ createdAt: -1 });
 jobSchema.index({ priority: 1 });
+jobSchema.index({ order: 1 });
 
-// Auto-generate job code
-jobSchema.pre('save', async function (next) {
+// Auto-generate job code (must be pre-validate so required:true passes)
+jobSchema.pre('validate', async function (next) {
   if (this.isNew && !this.jobCode) {
     const year = new Date().getFullYear();
     const count = await this.constructor.countDocuments({

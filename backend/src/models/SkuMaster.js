@@ -39,7 +39,8 @@ const skuMasterSchema = new mongoose.Schema({
     fileName: String,
     filePath: String,
     isPrimary: { type: Boolean, default: false },
-    uploadedAt: { type: Date, default: Date.now }
+    uploadedAt: { type: Date, default: Date.now },
+    source: { type: String, enum: ['manual', 'amazon', 'ebay'], default: 'manual' }
   }],
   // Pricing & Specifications
   basePrice: {

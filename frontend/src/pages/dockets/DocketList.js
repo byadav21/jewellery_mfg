@@ -1,8 +1,9 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Link } from 'react-router-dom';
 import { toast } from 'react-toastify';
 import { docketAPI } from '../../services/api';
 import DataTable from '../../components/common/DataTable';
+import useDebounce from '../../hooks/useDebounce';
 
 const DocketList = () => {
     const [dockets, setDockets] = useState([]);
@@ -20,13 +21,22 @@ const DocketList = () => {
         pages: 0
     });
 
+    // Debounce search input
+    const debouncedSearch = useDebounce(filters.search, 300);
+
+    // Create effective filters with debounced search
+    const effectiveFilters = useMemo(() => ({
+        ...filters,
+        search: debouncedSearch
+    }), [filters.status, filters.startDate, filters.endDate, debouncedSearch]);
+
     const fetchDockets = useCallback(async () => {
         try {
             setLoading(true);
             const params = {
                 page: pagination.page,
                 limit: pagination.limit,
-                ...filters
+                ...effectiveFilters
             };
             const response = await docketAPI.getAll(params);
             setDockets(response.data.data?.dockets || response.data.dockets || []);
@@ -40,7 +50,7 @@ const DocketList = () => {
         } finally {
             setLoading(false);
         }
-    }, [pagination.page, pagination.limit, filters]);
+    }, [pagination.page, pagination.limit, effectiveFilters]);
 
     useEffect(() => {
         fetchDockets();

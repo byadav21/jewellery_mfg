@@ -5,6 +5,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const orderController = require('../controllers/order.controller');
+const jobController = require('../controllers/job.controller');
 const { verifyToken, adminOrAbove, superAdminOnly, validate } = require('../middleware');
 
 // Ensure upload directories exist
@@ -101,6 +102,7 @@ router.post('/refresh-cad-status', adminOrAbove, orderController.refreshCadStatu
 router.get('/', adminOrAbove, orderController.getOrders);
 router.get('/statistics', adminOrAbove, orderController.getStatistics);
 router.get('/:id', adminOrAbove, orderController.getOrder);
+router.get('/:id/download-images', jobController.downloadOrderImagesZip);
 
 // Sync routes
 router.post('/sync/amazon', adminOrAbove, orderController.syncAmazon);
@@ -213,5 +215,8 @@ router.post('/:id/images', adminOrAbove, (req, res, next) => {
 }, orderController.uploadOrderImages);
 
 router.delete('/:id/images/:imageId', adminOrAbove, orderController.deleteOrderImage);
+
+// Delete order (super admin only)
+router.delete('/:id', superAdminOnly, orderController.deleteOrder);
 
 module.exports = router;

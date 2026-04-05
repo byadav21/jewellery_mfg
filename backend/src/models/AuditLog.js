@@ -7,50 +7,10 @@ const auditLogSchema = new mongoose.Schema({
   },
   action: {
     type: String,
-    required: true,
-    enum: [
-      'login',
-      'logout',
-      'login_failed',
-      'password_change',
-      'password_reset',
-      'user_create',
-      'user_update',
-      'user_delete',
-      'user_activate',
-      'user_deactivate',
-      'role_assign',
-      'role_remove',
-      'settings_update',
-      'api_credentials_view',
-      'api_credentials_update',
-      'job_create',
-      'job_update',
-      'job_delete',
-      'cad_upload',
-      'cad_approve',
-      'cad_reject',
-      'component_issue',
-      'component_return',
-      'manufacturing_assign',
-      'status_change',
-      'bulk_status_update',
-      'delivery_update',
-      'order_sync',
-      'order_create',
-      'order_update',
-      'order_view',
-      'bulk_assign',
-      'notification_send',
-      'fetch_images',
-      'upload',
-      'delete',
-      'update'
-    ]
+    required: true
   },
   entity: {
-    type: String,
-    enum: ['user', 'role', 'job', 'order', 'cad', 'component', 'delivery', 'settings', 'notification', 'product', 'sync']
+    type: String
   },
   entityId: {
     type: mongoose.Schema.Types.ObjectId

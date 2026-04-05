@@ -1,8 +1,9 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Link } from 'react-router-dom';
 import { toast } from 'react-toastify';
 import { userAPI, roleAPI } from '../../services/api';
 import DataTable from '../../components/common/DataTable';
+import useDebounce from '../../hooks/useDebounce';
 
 const UserList = () => {
   const [users, setUsers] = useState([]);
@@ -20,13 +21,22 @@ const UserList = () => {
     pages: 0
   });
 
+  // Debounce search input
+  const debouncedSearch = useDebounce(filters.search, 300);
+
+  // Create effective filters with debounced search
+  const effectiveFilters = useMemo(() => ({
+    ...filters,
+    search: debouncedSearch
+  }), [filters.role, filters.status, debouncedSearch]);
+
   const fetchUsers = useCallback(async () => {
     try {
       setLoading(true);
       const params = {
         page: pagination.page,
         limit: pagination.limit,
-        ...filters
+        ...effectiveFilters
       };
       const response = await userAPI.getAll(params);
       const data = response.data.data || response.data;
@@ -41,7 +51,7 @@ const UserList = () => {
     } finally {
       setLoading(false);
     }
-  }, [pagination.page, pagination.limit, filters]);
+  }, [pagination.page, pagination.limit, effectiveFilters]);
 
   const fetchRoles = async () => {
     try {

@@ -42,8 +42,7 @@ const docketSchema = new mongoose.Schema({
     timestamps: true
 });
 
-// Index for performance
-docketSchema.index({ docketNumber: 1 });
+// Index for performance (docketNumber already indexed via unique: true)
 docketSchema.index({ manufacturer: 1 });
 docketSchema.index({ status: 1 });
 

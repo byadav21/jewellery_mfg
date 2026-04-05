@@ -1,8 +1,9 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { toast } from 'react-toastify';
-import { orderAPI, userAPI, docketAPI } from '../../services/api';
+import { orderAPI, userAPI, docketAPI, marketplaceAccountAPI } from '../../services/api';
 import DataTable from '../../components/common/DataTable';
+import useDebounce from '../../hooks/useDebounce';
 
 const API_BASE_URL = process.env.REACT_APP_API_URL?.replace('/api', '') || 'http://localhost:5001';
 
@@ -41,6 +42,7 @@ const OrderList = () => {
     direction: 'desc'
   });
   const [marketplaceAccounts, setMarketplaceAccounts] = useState([]);
+  const [ebayMarketplaceAccounts, setEbayMarketplaceAccounts] = useState([]);
   const [syncAccountCode, setSyncAccountCode] = useState('all');
   const [importAll, setImportAll] = useState(false);
   const [syncType, setSyncType] = useState('amazon'); // 'amazon' or 'ebay'
@@ -88,6 +90,15 @@ const OrderList = () => {
     admin: []
   });
 
+  // Debounce search input (300ms delay)
+  const debouncedSearch = useDebounce(filters.search, 300);
+
+  // Create effective filters with debounced search
+  const effectiveFilters = useMemo(() => ({
+    ...filters,
+    search: debouncedSearch
+  }), [filters.channel, filters.status, filters.cadStatus, filters.accountCode, filters.startDate, filters.endDate, debouncedSearch]);
+
   const fetchOrders = useCallback(async () => {
     try {
       setLoading(true);
@@ -96,8 +107,9 @@ const OrderList = () => {
         limit: pagination.limit,
         sortField: sorting.field,
         sortDirection: sorting.direction,
-        ...filters
+        ...effectiveFilters
       };
+      console.log('[OrderList] Fetching orders with params:', params);
       const response = await orderAPI.getAll(params);
       setOrders(response.data.data?.orders || response.data.orders || []);
       if (response.data.data?.pagination || response.data.pagination) {
@@ -105,10 +117,11 @@ const OrderList = () => {
       }
     } catch (error) {
       console.error('Error fetching orders:', error);
+      toast.error('Failed to fetch orders');
     } finally {
       setLoading(false);
     }
-  }, [pagination.page, pagination.limit, sorting.field, sorting.direction, filters]);
+  }, [pagination.page, pagination.limit, sorting.field, sorting.direction, effectiveFilters]);
 
   // Handle sort change
   const handleSort = (field, direction) => {
@@ -127,9 +140,19 @@ const OrderList = () => {
 
   const fetchMarketplaceAccounts = async () => {
     try {
-      const response = await orderAPI.getAccountCodes(); // Assuming this returns codes
-      // For more details we might need a specific API
+      const response = await orderAPI.getAccountCodes();
       setMarketplaceAccounts(response.data.data || []);
+
+      // Also fetch eBay accounts from marketplace accounts API
+      try {
+        const accountsResponse = await marketplaceAccountAPI.getAll({ channel: 'ebay', isActive: true });
+        const ebayAccounts = (accountsResponse.data.data || accountsResponse.data || [])
+          .filter(a => a.channel === 'ebay')
+          .map(a => a.accountCode);
+        setEbayMarketplaceAccounts(ebayAccounts);
+      } catch (err) {
+        console.error('Error fetching eBay marketplace accounts:', err);
+      }
     } catch (error) {
       console.error('Error fetching marketplace accounts:', error);
     }
@@ -137,18 +160,33 @@ const OrderList = () => {
 
   useEffect(() => {
     fetchOrders();
+  }, [fetchOrders]);
+
+  // Load account codes on mount
+  useEffect(() => {
     fetchAccountCodes();
     fetchMarketplaceAccounts();
-  }, [fetchOrders]);
+  }, []);
 
   const handleFilterChange = (e) => {
     const { name, value } = e.target;
     setFilters(prev => ({ ...prev, [name]: value }));
-    setPagination(prev => ({ ...prev, page: 1 }));
+    // Reset to page 1 for non-search filters (search uses debounce)
+    if (name !== 'search') {
+      setPagination(prev => ({ ...prev, page: 1 }));
+    }
   };
+
+  // Reset pagination when debounced search changes
+  useEffect(() => {
+    if (debouncedSearch !== undefined) {
+      setPagination(prev => ({ ...prev, page: 1 }));
+    }
+  }, [debouncedSearch]);
 
   const handleOpenSyncModal = (type = 'amazon') => {
     setSyncType(type);
+    setSyncAccountCode('all');
     setShowSyncModal(true);
   };
 
@@ -169,15 +207,19 @@ const OrderList = () => {
       setSyncing(prev => ({ ...prev, [syncKey]: true }));
       setShowSyncModal(false);
 
-      // Ensure toDate is at least 2 minutes in the past to comply with Amazon API requirements
-      const now = new Date();
-      const twoMinutesAgo = new Date(now.getTime() - 2 * 60 * 1000);
-      const selectedToDate = new Date(syncDateRange.toDate + 'T23:59:59Z');
-
+      // For Amazon: Ensure toDate is at least 2 minutes in the past to comply with Amazon API requirements
+      // For eBay: No such requirement, use the date as-is
       let adjustedToDate = syncDateRange.toDate;
-      if (selectedToDate > twoMinutesAgo) {
-        adjustedToDate = twoMinutesAgo.toISOString().split('T')[0];
-        toast.info(`Adjusted "To Date" to ${adjustedToDate} to comply with Amazon API requirements (must be at least 2 minutes in the past)`);
+
+      if (isAmazon) {
+        const now = new Date();
+        const twoMinutesAgo = new Date(now.getTime() - 2 * 60 * 1000);
+        const selectedToDate = new Date(syncDateRange.toDate + 'T23:59:59Z');
+
+        if (selectedToDate > twoMinutesAgo) {
+          adjustedToDate = twoMinutesAgo.toISOString().split('T')[0];
+          toast.info(`Adjusted "To Date" to ${adjustedToDate} to comply with Amazon API requirements (must be at least 2 minutes in the past)`);
+        }
       }
 
       const payload = {
@@ -545,7 +587,7 @@ const OrderList = () => {
       toast.success(`${inlineAssignType === 'cadDesigner' ? 'CAD Designer' : inlineAssignType === 'manufacturer' ? 'Manufacturer' : 'Admin'} assigned successfully`);
       setInlineAssignOrderId(null);
     } catch (error) {
-      toast.error('Failed to assign user');
+      toast.error(error.response?.data?.message || 'Failed to assign user');
     } finally {
       setInlineAssigning(false);
     }
@@ -807,7 +849,7 @@ const OrderList = () => {
                       type="text"
                       className="form-control"
                       name="search"
-                      placeholder="Order ID, Customer name..."
+                      placeholder="Order ID, Customer, SKU, Product..."
                       value={filters.search}
                       onChange={handleFilterChange}
                     />
@@ -979,6 +1021,25 @@ const OrderList = () => {
                                   <i className="fas fa-cube"></i>
                                 </a>
                               )}
+                            </div>
+                          ))}
+                        </div>
+                      );
+                    }
+                  },
+                  {
+                    key: 'product',
+                    title: 'Product',
+                    render: (_, order) => {
+                      const items = order.items || [];
+                      if (items.length === 0) return <span className="text-muted">-</span>;
+                      return (
+                        <div>
+                          {items.map((item, idx) => (
+                            <div key={idx} className="mb-1">
+                              <small className="text-truncate d-inline-block" style={{ maxWidth: '160px' }} title={item.productName || '-'}>
+                                {item.productName || '-'}
+                              </small>
                             </div>
                           ))}
                         </div>
@@ -1798,7 +1859,7 @@ const OrderList = () => {
                 </button>
               </div>
               <div className="modal-body">
-                <p>Select the marketplace and date range to fetch orders:</p>
+                <p>Select the date range to fetch orders:</p>
                 <div className="row">
                   <div className="col-md-12">
                     <div className="form-group">
@@ -1809,7 +1870,7 @@ const OrderList = () => {
                         onChange={(e) => setSyncAccountCode(e.target.value)}
                       >
                         <option value="all">All Activated Accounts</option>
-                        {marketplaceAccounts.map(account => (
+                        {(syncType === 'amazon' ? marketplaceAccounts : ebayMarketplaceAccounts).map(account => (
                           <option key={account} value={account}>{account}</option>
                         ))}
                       </select>
@@ -1840,6 +1901,7 @@ const OrderList = () => {
                     </div>
                   </div>
                 </div>
+                {syncType === 'amazon' && (
                 <div className="row mt-3">
                   <div className="col-md-12">
                     <div className="custom-control custom-checkbox">
@@ -1859,14 +1921,15 @@ const OrderList = () => {
                     </small>
                   </div>
                 </div>
-                <div className={`alert mt-3 mb-0 ${importAll ? 'alert-warning' : 'alert-info'}`}>
+                )}
+                <div className={`alert mt-3 mb-0 ${syncType === 'amazon' && importAll ? 'alert-warning' : 'alert-info'}`}>
                   <small>
                     <i className="fas fa-info-circle mr-1"></i>
-                    {importAll
-                      ? `Fetching ALL ${syncType === 'amazon' ? 'Amazon' : 'eBay'} orders regardless of status or fulfillment channel.`
-                      : syncType === 'amazon'
-                        ? 'Only Pending, Unshipped, or PartiallyShipped MFN orders will be fetched.'
-                        : 'Only Paid eBay orders will be fetched.'}
+                    {syncType === 'amazon'
+                      ? (importAll
+                        ? 'Fetching ALL Amazon orders regardless of status or fulfillment channel.'
+                        : 'Only Pending, Unshipped, or PartiallyShipped MFN orders will be fetched.')
+                      : 'All eBay orders in the selected date range will be fetched. Duplicates are automatically skipped.'}
                   </small>
                 </div>
               </div>

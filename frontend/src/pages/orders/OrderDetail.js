@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { toast } from 'react-toastify';
-import { orderAPI, auditLogAPI, userAPI, jobAPI } from '../../services/api';
+import { orderAPI, auditLogAPI, userAPI, jobAPI, manufacturingAPI } from '../../services/api';
+import { useAuth } from '../../context/AuthContext';
 
 const API_BASE_URL = process.env.REACT_APP_API_URL?.replace('/api', '') || 'http://localhost:5001';
 
@@ -28,13 +29,39 @@ const JOB_STAGES = [
 const OrderDetail = () => {
   const { id } = useParams();
   const navigate = useNavigate();
+  const { isSuperAdmin } = useAuth();
   const [loading, setLoading] = useState(true);
   const [order, setOrder] = useState(null);
   const [items, setItems] = useState([]);
   const [jobs, setJobs] = useState([]);
+  const [productionFiles, setProductionFiles] = useState([]);
   const [activityLogs, setActivityLogs] = useState([]);
   const [loadingLogs, setLoadingLogs] = useState(false);
   const [fetchingImages, setFetchingImages] = useState({});
+  const [deleting, setDeleting] = useState(false);
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [deleteType, setDeleteType] = useState('soft'); // 'soft' or 'hard'
+  const [downloadingZip, setDownloadingZip] = useState(false);
+
+  // ZIP download for entire order
+  const handleDownloadOrderZip = async () => {
+    try {
+      setDownloadingZip(true);
+      const response = await orderAPI.downloadImagesZip(id);
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', `order_${order?.externalOrderId || id.slice(-8)}_all_files.zip`);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (error) {
+      toast.error('Failed to download ZIP');
+    } finally {
+      setDownloadingZip(false);
+    }
+  };
 
   // Job status history for funnel
   const [jobHistories, setJobHistories] = useState({});
@@ -61,6 +88,7 @@ const OrderDetail = () => {
         setOrder(response.data.data.order);
         setItems(response.data.data.items || []);
         setJobs(response.data.data.jobs || []);
+        setProductionFiles(response.data.data.productionFiles || []);
       }
     } catch (error) {
       console.error('Error fetching order:', error);
@@ -346,7 +374,7 @@ const OrderDetail = () => {
       fetchOrder();
       fetchActivityLogs();
     } catch (error) {
-      toast.error('Failed to assign user');
+      toast.error(error.response?.data?.message || 'Failed to assign user');
     } finally {
       setAssigning(false);
     }
@@ -366,6 +394,21 @@ const OrderDetail = () => {
       if (manufacturer) assignments.manufacturer = manufacturer;
     }
     return assignments;
+  };
+
+  // Delete order handler (super admin only)
+  const handleDeleteOrder = async () => {
+    try {
+      setDeleting(true);
+      await orderAPI.delete(id, deleteType);
+      toast.success(deleteType === 'hard' ? 'Order permanently deleted' : 'Order moved to trash');
+      setShowDeleteModal(false);
+      navigate('/orders');
+    } catch (error) {
+      toast.error(error.response?.data?.message || 'Failed to delete order');
+    } finally {
+      setDeleting(false);
+    }
   };
 
   if (loading) {
@@ -422,11 +465,19 @@ const OrderDetail = () => {
 
       <section className="content">
         <div className="container-fluid">
-          {/* Back Button */}
-          <div className="mb-3">
+          {/* Back Button and Actions */}
+          <div className="mb-3 d-flex justify-content-between">
             <button className="btn btn-secondary" onClick={() => navigate('/orders')}>
               <i className="fas fa-arrow-left mr-1"></i> Back to Orders
             </button>
+            {isSuperAdmin() && (
+              <button
+                className="btn btn-danger"
+                onClick={() => setShowDeleteModal(true)}
+              >
+                <i className="fas fa-trash mr-1"></i> Delete Order
+              </button>
+            )}
           </div>
 
           <div className="row">
@@ -486,6 +537,16 @@ const OrderDetail = () => {
                         <td className="text-muted">CAD Status:</td>
                         <td>{getCadStatusBadge(order.cadSummary)}</td>
                       </tr>
+                      {order.currentJobStatus && (
+                        <tr>
+                          <td className="text-muted">Current Stage:</td>
+                          <td>
+                            <span className={`badge badge-${getJobStatusBadge(order.currentJobStatus)}`}>
+                              {order.currentJobStatus?.replace(/_/g, ' ').toUpperCase()}
+                            </span>
+                          </td>
+                        </tr>
+                      )}
                       <tr>
                         <td className="text-muted">Last Synced:</td>
                         <td>{formatDate(order.syncedAt)}</td>
@@ -685,7 +746,42 @@ const OrderDetail = () => {
                           )}
                         </td>
                         <td className="text-center">
-                          {order.channel === 'amazon' && item.asinOrItemId ? (
+                          {/* Show product images if available */}
+                          {item.productImages && item.productImages.length > 0 ? (
+                            <div className="d-flex align-items-center justify-content-center">
+                              <div className="d-flex" style={{ gap: '2px' }}>
+                                {item.productImages.slice(0, 3).map((img, imgIdx) => (
+                                  <img
+                                    key={imgIdx}
+                                    src={`${API_BASE_URL}${img.filePath}`}
+                                    alt={`Product ${imgIdx + 1}`}
+                                    className="img-thumbnail"
+                                    style={{ width: '30px', height: '30px', objectFit: 'cover', cursor: 'pointer' }}
+                                    onClick={() => window.open(`${API_BASE_URL}${img.filePath}`, '_blank')}
+                                    title={img.fileName || `Image ${imgIdx + 1}`}
+                                  />
+                                ))}
+                                {item.productImages.length > 3 && (
+                                  <span className="badge badge-secondary align-self-center ml-1">+{item.productImages.length - 3}</span>
+                                )}
+                              </div>
+                              {/* Refresh button */}
+                              {order.channel === 'amazon' && item.asinOrItemId && (
+                                <button
+                                  className="btn btn-outline-info btn-xs ml-1"
+                                  onClick={() => handleFetchImages(item.asinOrItemId, item.sku, item._id)}
+                                  disabled={fetchingImages[item._id]}
+                                  title="Refresh images from Amazon"
+                                >
+                                  {fetchingImages[item._id] ? (
+                                    <span className="spinner-border spinner-border-sm"></span>
+                                  ) : (
+                                    <i className="fas fa-sync-alt" style={{ fontSize: '10px' }}></i>
+                                  )}
+                                </button>
+                              )}
+                            </div>
+                          ) : order.channel === 'amazon' && item.asinOrItemId ? (
                             <button
                               className="btn btn-info btn-xs"
                               onClick={() => handleFetchImages(item.asinOrItemId, item.sku, item._id)}
@@ -695,7 +791,26 @@ const OrderDetail = () => {
                               {fetchingImages[item._id] ? (
                                 <span className="spinner-border spinner-border-sm"></span>
                               ) : (
-                                <i className="fas fa-image"></i>
+                                <>
+                                  <i className="fas fa-download mr-1"></i>
+                                  <i className="fas fa-image"></i>
+                                </>
+                              )}
+                            </button>
+                          ) : order.channel === 'ebay' && item.asinOrItemId ? (
+                            <button
+                              className="btn btn-warning btn-xs"
+                              onClick={() => handleFetchImages(item.asinOrItemId, item.sku, item._id)}
+                              disabled={fetchingImages[item._id]}
+                              title="Fetch images from eBay"
+                            >
+                              {fetchingImages[item._id] ? (
+                                <span className="spinner-border spinner-border-sm"></span>
+                              ) : (
+                                <>
+                                  <i className="fas fa-download mr-1"></i>
+                                  <i className="fas fa-image"></i>
+                                </>
                               )}
                             </button>
                           ) : (
@@ -1004,6 +1119,99 @@ const OrderDetail = () => {
             </div>
           )}
 
+          {/* Manufacturing / Production Files */}
+          {productionFiles.length > 0 && (
+            <div className="card">
+              <div className="card-header d-flex justify-content-between align-items-center">
+                <h3 className="card-title mb-0">
+                  <i className="fas fa-industry mr-2"></i>
+                  Manufacturing Files ({productionFiles.length})
+                </h3>
+                <button
+                  className="btn btn-sm btn-outline-success"
+                  onClick={handleDownloadOrderZip}
+                  disabled={downloadingZip}
+                >
+                  {downloadingZip ? (
+                    <><span className="spinner-border spinner-border-sm mr-1"></span> Zipping...</>
+                  ) : (
+                    <><i className="fas fa-file-archive mr-1"></i> Download All (ZIP)</>
+                  )}
+                </button>
+              </div>
+              <div className="card-body">
+                {['final', 'qc', 'in_progress'].map(stage => {
+                  const stageFiles = productionFiles.filter(f => (f.stage || 'final') === stage);
+                  if (stageFiles.length === 0) return null;
+                  const stageLabels = { final: 'Final Product', qc: 'QC / Inspection', in_progress: 'In Progress' };
+                  const stageColors = { final: 'success', qc: 'info', in_progress: 'warning' };
+                  return (
+                    <div key={stage} className="mb-3">
+                      <h6>
+                        <span className={`badge badge-${stageColors[stage]} mr-2`}>{stageLabels[stage]}</span>
+                        ({stageFiles.length} files)
+                      </h6>
+                      <div className="row">
+                        {stageFiles.map((file, idx) => {
+                          const filePath = file.filePath || file.path;
+                          const fileName = file.fileName || file.filename;
+                          const isImage = file.fileType === 'image' || file.mimeType?.startsWith('image/');
+                          const isVideo = file.fileType === 'video' || file.mimeType?.startsWith('video/');
+                          const isPdf = file.fileType === 'document' || file.mimeType?.includes('pdf');
+                          // Find the job this file belongs to
+                          const relatedJob = jobs.find(j => j._id === (file.job?.toString?.() || file.job));
+                          return (
+                            <div key={file._id || idx} className="col-md-2 col-sm-3 col-4 mb-3">
+                              <div className="card h-100">
+                                <div className="card-body text-center p-2">
+                                  {isImage ? (
+                                    <img
+                                      src={`${API_BASE_URL}${filePath}`}
+                                      alt={fileName}
+                                      className="img-fluid img-thumbnail mb-1"
+                                      style={{ maxHeight: '120px', objectFit: 'cover', cursor: 'pointer' }}
+                                      onClick={() => window.open(`${API_BASE_URL}${filePath}`, '_blank')}
+                                    />
+                                  ) : isVideo ? (
+                                    <div className="py-2" style={{ cursor: 'pointer' }} onClick={() => window.open(`${API_BASE_URL}${filePath}`, '_blank')}>
+                                      <i className="fas fa-video fa-3x text-primary"></i>
+                                    </div>
+                                  ) : (
+                                    <div className="py-2" style={{ cursor: 'pointer' }} onClick={() => window.open(`${API_BASE_URL}${filePath}`, '_blank')}>
+                                      <i className={`fas ${isPdf ? 'fa-file-pdf text-danger' : 'fa-file text-secondary'} fa-3x`}></i>
+                                    </div>
+                                  )}
+                                  <p className="small text-truncate mb-0" title={fileName}>{fileName}</p>
+                                  {file.remarks && (
+                                    <small className="text-muted d-block text-truncate" title={file.remarks}>{file.remarks}</small>
+                                  )}
+                                  <small className="text-muted d-block">
+                                    {file.uploadedBy?.name || ''}
+                                  </small>
+                                  <small className="text-muted d-block">
+                                    {file.uploadedAt ? new Date(file.uploadedAt).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : ''}
+                                  </small>
+                                  {relatedJob && (
+                                    <small className="text-muted d-block">
+                                      Job: <Link to={`/jobs/${relatedJob._id}`}>{relatedJob.jobCode || relatedJob._id.slice(-6)}</Link>
+                                    </small>
+                                  )}
+                                  <a href={`${API_BASE_URL}${filePath}`} target="_blank" rel="noopener noreferrer" className="btn btn-xs btn-outline-primary mt-1" download>
+                                    <i className="fas fa-download"></i>
+                                  </a>
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           {/* Order Activity History */}
           <div className="card">
             <div className="card-header">
@@ -1155,6 +1363,111 @@ const OrderDetail = () => {
                       <i className="fas fa-check mr-1"></i>
                       Assign
                     </>
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Order Modal */}
+      {showDeleteModal && (
+        <div className="modal fade show" style={{ display: 'block', backgroundColor: 'rgba(0,0,0,0.5)' }}>
+          <div className="modal-dialog">
+            <div className="modal-content">
+              <div className="modal-header bg-danger">
+                <h5 className="modal-title text-white">
+                  <i className="fas fa-exclamation-triangle mr-2"></i>
+                  Delete Order
+                </h5>
+                <button type="button" className="close text-white" onClick={() => setShowDeleteModal(false)}>
+                  <span>&times;</span>
+                </button>
+              </div>
+              <div className="modal-body">
+                <div className="alert alert-warning">
+                  <strong>Order ID:</strong> {order.externalOrderId || order.marketplaceOrderId || id}
+                </div>
+
+                <div className="form-group">
+                  <label className="font-weight-bold">Select Delete Type:</label>
+
+                  <div className="custom-control custom-radio mt-2">
+                    <input
+                      type="radio"
+                      id="deleteTypeSoft"
+                      name="deleteType"
+                      className="custom-control-input"
+                      checked={deleteType === 'soft'}
+                      onChange={() => setDeleteType('soft')}
+                    />
+                    <label className="custom-control-label" htmlFor="deleteTypeSoft">
+                      <span className="text-warning font-weight-bold">
+                        <i className="fas fa-archive mr-1"></i> Soft Delete (Move to Trash)
+                      </span>
+                      <br />
+                      <small className="text-muted">
+                        Order will be marked as deleted but can be restored later. Associated jobs will be marked as cancelled.
+                      </small>
+                    </label>
+                  </div>
+
+                  <div className="custom-control custom-radio mt-3">
+                    <input
+                      type="radio"
+                      id="deleteTypeHard"
+                      name="deleteType"
+                      className="custom-control-input"
+                      checked={deleteType === 'hard'}
+                      onChange={() => setDeleteType('hard')}
+                    />
+                    <label className="custom-control-label" htmlFor="deleteTypeHard">
+                      <span className="text-danger font-weight-bold">
+                        <i className="fas fa-trash-alt mr-1"></i> Hard Delete (Permanent)
+                      </span>
+                      <br />
+                      <small className="text-muted">
+                        Order and all associated data (jobs, items, files) will be permanently deleted. This action cannot be undone!
+                      </small>
+                    </label>
+                  </div>
+                </div>
+
+                {deleteType === 'hard' && (
+                  <div className="alert alert-danger mt-3">
+                    <i className="fas fa-exclamation-circle mr-1"></i>
+                    <strong>Warning:</strong> This will permanently delete:
+                    <ul className="mb-0 mt-2">
+                      <li>The order record</li>
+                      <li>All {items.length} order item(s)</li>
+                      <li>All {jobs.length} associated job(s)</li>
+                      <li>All CAD files and images</li>
+                    </ul>
+                  </div>
+                )}
+              </div>
+              <div className="modal-footer">
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  onClick={() => setShowDeleteModal(false)}
+                  disabled={deleting}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className={`btn ${deleteType === 'hard' ? 'btn-danger' : 'btn-warning'}`}
+                  onClick={handleDeleteOrder}
+                  disabled={deleting}
+                >
+                  {deleting ? (
+                    <><span className="spinner-border spinner-border-sm mr-1"></span> Deleting...</>
+                  ) : deleteType === 'hard' ? (
+                    <><i className="fas fa-trash-alt mr-1"></i> Permanently Delete</>
+                  ) : (
+                    <><i className="fas fa-archive mr-1"></i> Move to Trash</>
                   )}
                 </button>
               </div>

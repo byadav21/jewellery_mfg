@@ -1,5 +1,95 @@
-const { Job, JobStatusLog, MarketplaceOrderItem, AuditLog, SkuMaster } = require('../models');
+const { Job, JobStatusLog, MarketplaceOrder, MarketplaceOrderItem, AuditLog, SkuMaster, ProductionFile } = require('../models');
 const notificationService = require('../services/notification.service');
+const path = require('path');
+const fs = require('fs');
+const archiver = require('archiver');
+
+// Status -> allowed sub-statuses mapping
+const STATUS_SUB_STATUS_MAP = {
+  new: ['Pending Review', 'Awaiting Assignment'],
+  cad_assigned: ['Awaiting Designer', 'Design Brief Sent'],
+  cad_in_progress: ['Sketching', 'Modeling', 'Rendering', 'Revision'],
+  cad_submitted: ['Pending Review', 'Under Review'],
+  cad_approved: ['Approved', 'Ready for Manufacturing'],
+  cad_rejected: ['Needs Revision', 'Major Changes', 'Minor Changes'],
+  components_issued: ['Materials Prepared', 'Waiting Components', 'Components Ready'],
+  manufacturing_assigned: ['Awaiting Acceptance', 'Notified'],
+  manufacturing_accepted: ['Planning', 'Preparing Materials'],
+  manufacturing_in_progress: ['Casting', 'Setting', 'Polishing', 'Engraving', 'Assembly', 'Custom Work'],
+  manufacturing_ready_qc: ['QC Pending', 'QC In Progress', 'QC Passed', 'QC Failed - Rework'],
+  manufacturing_ready_delivery: ['Final Inspection', 'Packaging', 'Ready to Ship'],
+  ready_for_pickup: ['Awaiting Pickup', 'Pickup Scheduled'],
+  shipped: ['In Transit', 'Out for Delivery'],
+  delivered: ['Delivered', 'Confirmed'],
+  cancelled: ['Customer Request', 'Quality Issue', 'Other']
+};
+
+// Export for use in routes
+exports.STATUS_SUB_STATUS_MAP = STATUS_SUB_STATUS_MAP;
+
+// Get sub-status options for a status
+exports.getSubStatusOptions = async (req, res) => {
+  res.json({
+    success: true,
+    data: STATUS_SUB_STATUS_MAP
+  });
+};
+
+// Update sub-status
+exports.updateSubStatus = async (req, res) => {
+  try {
+    const { subStatus, remarks } = req.body;
+    const job = await Job.findById(req.params.id);
+
+    if (!job) {
+      return res.status(404).json({ success: false, message: 'Job not found' });
+    }
+
+    if (!subStatus) {
+      return res.status(400).json({ success: false, message: 'Sub-status is required' });
+    }
+
+    // Validate sub-status belongs to current status
+    const allowedSubStatuses = STATUS_SUB_STATUS_MAP[job.status] || [];
+    if (allowedSubStatuses.length > 0 && !allowedSubStatuses.includes(subStatus)) {
+      return res.status(400).json({
+        success: false,
+        message: `Invalid sub-status "${subStatus}" for status "${job.status}". Allowed: ${allowedSubStatuses.join(', ')}`
+      });
+    }
+
+    const oldSubStatus = job.subStatus;
+    job.subStatus = subStatus;
+    job.subStatusHistory.push({
+      subStatus,
+      changedBy: req.userId,
+      changedAt: new Date(),
+      remarks
+    });
+    await job.save();
+
+    await AuditLog.log({
+      user: req.userId,
+      action: 'status_change',
+      entity: 'job',
+      entityId: job._id,
+      description: `Sub-status changed: ${oldSubStatus || 'none'} -> ${subStatus} (status: ${job.status})`,
+      oldValues: { subStatus: oldSubStatus },
+      newValues: { subStatus },
+      ipAddress: req.ip,
+      userAgent: req.get('User-Agent')
+    });
+
+    res.json({
+      success: true,
+      message: 'Sub-status updated successfully',
+      data: job
+    });
+  } catch (error) {
+    console.error('Update sub-status error:', error);
+    res.status(500).json({ success: false, message: 'Failed to update sub-status' });
+  }
+};
 
 // Get all jobs
 exports.getJobs = async (req, res) => {
@@ -30,7 +120,8 @@ exports.getJobs = async (req, res) => {
       query.$or = [
         { jobCode: { $regex: search, $options: 'i' } },
         { sku: { $regex: search, $options: 'i' } },
-        { productName: { $regex: search, $options: 'i' } }
+        { productName: { $regex: search, $options: 'i' } },
+        { customerName: { $regex: search, $options: 'i' } }
       ];
     }
 
@@ -94,13 +185,38 @@ exports.getJob = async (req, res) => {
       .populate('cadDesigner', 'name email phone')
       .populate('manufacturer', 'name email phone')
       .populate('order')
-      .populate('orderItem');
+      .populate('orderItem')
+      .lean();
 
     if (!job) {
       return res.status(404).json({
         success: false,
         message: 'Job not found'
       });
+    }
+
+    // Enrich with SkuMaster CAD file info if job has SKU
+    if (job.sku) {
+      const skuMaster = await SkuMaster.findOne({ sku: job.sku.toUpperCase(), isActive: true }).lean();
+      if (skuMaster) {
+        job.skuMasterRef = skuMaster._id;
+        // If job doesn't have CAD file but SkuMaster does, populate from SkuMaster
+        if (!job.hasCadFile && skuMaster.hasCadFile) {
+          job.hasCadFile = true;
+          job.cadFilePath = skuMaster.cadFile?.filePath || null;
+          job.cadFileName = skuMaster.cadFile?.fileName || null;
+        }
+        // Always provide SkuMaster CAD info for reference
+        job.skuMasterCad = {
+          hasCadFile: skuMaster.hasCadFile || false,
+          cadFilePath: skuMaster.cadFile?.filePath || null,
+          cadFileName: skuMaster.cadFile?.fileName || null
+        };
+        // Provide product images from SkuMaster
+        if (skuMaster.images && skuMaster.images.length > 0) {
+          job.skuMasterImages = skuMaster.images;
+        }
+      }
     }
 
     res.json({
@@ -246,6 +362,26 @@ exports.updateStatus = async (req, res) => {
       });
     }
 
+    // Check if changing to cad_submitted - require STL/CAD file upload
+    if (status === 'cad_submitted') {
+      let hasCadFile = !!(job.cadFilePath || job.hasCadFile);
+
+      if (!hasCadFile && job.sku) {
+        const skuMaster = await SkuMaster.findOne({ sku: job.sku.toUpperCase(), isActive: true });
+        hasCadFile = !!(skuMaster?.hasCadFile || skuMaster?.cadFile?.filePath);
+      }
+
+      if (!hasCadFile) {
+        const isSuperAdmin = req.user?.roles?.some(r => r.name === 'super_admin');
+        if (!isSuperAdmin) {
+          return res.status(400).json({
+            success: false,
+            message: `Please upload the STL/CAD file before submitting job ${job.jobCode} (SKU: ${job.sku || 'N/A'}). Status cannot be changed to "CAD Submitted" without a file.`
+          });
+        }
+      }
+    }
+
     // Manufacturing statuses that require CAD file
     const manufacturingStatuses = [
       'manufacturing_assigned',
@@ -279,7 +415,34 @@ exports.updateStatus = async (req, res) => {
 
     const oldStatus = job.status;
     job.status = status;
+    // Reset sub-status when main status changes
+    job.subStatus = null;
     await job.save();
+
+    // Propagate job status to parent Order's status
+    if (job.order) {
+      const processingStatuses = [
+        'cad_assigned', 'cad_in_progress', 'cad_submitted', 'cad_approved', 'cad_rejected',
+        'components_issued', 'manufacturing_assigned', 'manufacturing_accepted',
+        'manufacturing_in_progress', 'manufacturing_ready_qc', 'manufacturing_ready_delivery'
+      ];
+      if (processingStatuses.includes(status)) {
+        await MarketplaceOrder.findByIdAndUpdate(job.order, { status: 'processing' });
+      } else if (status === 'delivered') {
+        // Only mark order delivered if all its jobs are delivered
+        const allJobs = await Job.find({ order: job.order });
+        const allDelivered = allJobs.every(j => j.status === 'delivered');
+        if (allDelivered) {
+          await MarketplaceOrder.findByIdAndUpdate(job.order, { status: 'delivered' });
+        }
+      } else if (status === 'cancelled') {
+        const allJobs = await Job.find({ order: job.order });
+        const allCancelled = allJobs.every(j => j.status === 'cancelled');
+        if (allCancelled) {
+          await MarketplaceOrder.findByIdAndUpdate(job.order, { status: 'cancelled' });
+        }
+      }
+    }
 
     // Create status log
     await JobStatusLog.create({
@@ -439,5 +602,129 @@ exports.getStatistics = async (req, res) => {
       success: false,
       message: 'Failed to fetch statistics'
     });
+  }
+};
+
+// Download product images as ZIP (for a job's SKU)
+exports.downloadProductImagesZip = async (req, res) => {
+  try {
+    const { type } = req.query; // 'product', 'manufacturing', 'all'
+    const job = await Job.findById(req.params.id).lean();
+
+    if (!job) {
+      return res.status(404).json({ success: false, message: 'Job not found' });
+    }
+
+    const archive = archiver('zip', { zlib: { level: 5 } });
+    const zipName = `${job.sku || job.jobCode || 'files'}_${type || 'all'}.zip`;
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${zipName}"`);
+    archive.pipe(res);
+
+    const uploadsDir = path.join(__dirname, '../../uploads');
+
+    // Add product images from SkuMaster
+    if (type === 'product' || type === 'all' || !type) {
+      if (job.sku) {
+        const skuMaster = await SkuMaster.findOne({ sku: job.sku.toUpperCase(), isActive: true }).lean();
+        if (skuMaster && skuMaster.images) {
+          for (const img of skuMaster.images) {
+            const filePath = path.join(uploadsDir, '..', img.filePath);
+            if (fs.existsSync(filePath)) {
+              archive.file(filePath, { name: `product-images/${img.fileName || path.basename(filePath)}` });
+            }
+          }
+        }
+        // Also add CAD file
+        if (skuMaster && skuMaster.cadFile && skuMaster.cadFile.filePath) {
+          const cadPath = path.join(uploadsDir, '..', skuMaster.cadFile.filePath);
+          if (fs.existsSync(cadPath)) {
+            archive.file(cadPath, { name: `cad/${skuMaster.cadFile.fileName || path.basename(cadPath)}` });
+          }
+        }
+      }
+    }
+
+    // Add manufacturing/production files
+    if (type === 'manufacturing' || type === 'all' || !type) {
+      const prodFiles = await ProductionFile.find({ job: job._id }).lean();
+      for (const file of prodFiles) {
+        const filePath = path.join(uploadsDir, '..', file.filePath);
+        if (fs.existsSync(filePath)) {
+          const folder = file.stage === 'final' ? 'final-product' : file.stage === 'qc' ? 'qc' : 'in-progress';
+          archive.file(filePath, { name: `manufacturing/${folder}/${file.fileName || path.basename(filePath)}` });
+        }
+      }
+    }
+
+    await archive.finalize();
+  } catch (error) {
+    console.error('Download ZIP error:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, message: 'Failed to create ZIP' });
+    }
+  }
+};
+
+// Download product images as ZIP for an order (all jobs)
+exports.downloadOrderImagesZip = async (req, res) => {
+  try {
+    const jobs = await Job.find({ order: req.params.id }).lean();
+
+    if (!jobs.length) {
+      return res.status(404).json({ success: false, message: 'No jobs found for this order' });
+    }
+
+    const archive = archiver('zip', { zlib: { level: 5 } });
+    const zipName = `order_${req.params.id.slice(-8)}_all_files.zip`;
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${zipName}"`);
+    archive.pipe(res);
+
+    const uploadsDir = path.join(__dirname, '../../uploads');
+    const addedSkus = new Set();
+
+    for (const job of jobs) {
+      const jobFolder = job.sku || job.jobCode || job._id.toString().slice(-6);
+
+      // Product images (deduplicate by SKU)
+      if (job.sku && !addedSkus.has(job.sku.toUpperCase())) {
+        addedSkus.add(job.sku.toUpperCase());
+        const skuMaster = await SkuMaster.findOne({ sku: job.sku.toUpperCase(), isActive: true }).lean();
+        if (skuMaster && skuMaster.images) {
+          for (const img of skuMaster.images) {
+            const filePath = path.join(uploadsDir, '..', img.filePath);
+            if (fs.existsSync(filePath)) {
+              archive.file(filePath, { name: `${jobFolder}/product-images/${img.fileName || path.basename(filePath)}` });
+            }
+          }
+        }
+        if (skuMaster && skuMaster.cadFile && skuMaster.cadFile.filePath) {
+          const cadPath = path.join(uploadsDir, '..', skuMaster.cadFile.filePath);
+          if (fs.existsSync(cadPath)) {
+            archive.file(cadPath, { name: `${jobFolder}/cad/${skuMaster.cadFile.fileName || path.basename(cadPath)}` });
+          }
+        }
+      }
+
+      // Manufacturing files
+      const prodFiles = await ProductionFile.find({ job: job._id }).lean();
+      for (const file of prodFiles) {
+        const filePath = path.join(uploadsDir, '..', file.filePath);
+        if (fs.existsSync(filePath)) {
+          const folder = file.stage === 'final' ? 'final-product' : file.stage === 'qc' ? 'qc' : 'in-progress';
+          archive.file(filePath, { name: `${jobFolder}/manufacturing/${folder}/${file.fileName || path.basename(filePath)}` });
+        }
+      }
+    }
+
+    await archive.finalize();
+  } catch (error) {
+    console.error('Download order ZIP error:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, message: 'Failed to create ZIP' });
+    }
   }
 };

@@ -1,8 +1,9 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Link } from 'react-router-dom';
 import { toast } from 'react-toastify';
 import { manufacturingAPI, userAPI } from '../../services/api';
 import { useAuth } from '../../context/AuthContext';
+import useDebounce from '../../hooks/useDebounce';
 
 const ManufacturingJobList = () => {
   const [jobs, setJobs] = useState([]);
@@ -38,13 +39,22 @@ const ManufacturingJobList = () => {
   const [assignDeadline, setAssignDeadline] = useState('');
   const [assignNotes, setAssignNotes] = useState('');
 
+  // Debounce search input
+  const debouncedSearch = useDebounce(filters.search, 300);
+
+  // Create effective filters with debounced search
+  const effectiveFilters = useMemo(() => ({
+    ...filters,
+    search: debouncedSearch
+  }), [filters.status, filters.priority, debouncedSearch]);
+
   const fetchJobs = useCallback(async () => {
     try {
       setLoading(true);
       const params = {
         page: pagination.page,
         limit: pagination.limit,
-        ...filters
+        ...effectiveFilters
       };
 
       let response;
@@ -63,7 +73,7 @@ const ManufacturingJobList = () => {
     } finally {
       setLoading(false);
     }
-  }, [pagination.page, pagination.limit, filters, isAdmin, isManufacturer]);
+  }, [pagination.page, pagination.limit, effectiveFilters, isAdmin, isManufacturer]);
 
   const fetchManufacturers = async () => {
     try {
@@ -436,7 +446,7 @@ const ManufacturingJobList = () => {
                     type="text"
                     className="form-control"
                     name="search"
-                    placeholder="Job code, product name, SKU..."
+                    placeholder="Job Code, SKU, Product, Customer..."
                     value={filters.search}
                     onChange={handleFilterChange}
                   />

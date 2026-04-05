@@ -420,8 +420,8 @@ const MarketplaceAccountList = () => {
 
       {/* Add/Edit Account Modal */}
       {showModal && (
-        <div className="modal fade show" style={{ display: 'block' }} tabIndex="-1">
-          <div className="modal-dialog modal-lg">
+        <div className="modal fade show" style={{ display: 'block', overflow: 'auto' }} tabIndex="-1">
+          <div className="modal-dialog modal-lg" style={{ maxWidth: '95%', margin: '1.75rem auto' }}>
             <div className="modal-content">
               <div className="modal-header">
                 <h5 className="modal-title">
@@ -432,10 +432,10 @@ const MarketplaceAccountList = () => {
                 </button>
               </div>
               <form onSubmit={handleSubmit}>
-                <div className="modal-body">
+                <div className="modal-body" style={{ maxHeight: 'calc(100vh - 200px)', overflowY: 'auto' }}>
                   {/* Basic Info */}
                   <div className="row">
-                    <div className="col-md-6">
+                    <div className="col-12 col-sm-6">
                       <div className="form-group">
                         <label>Account Name <span className="text-danger">*</span></label>
                         <input
@@ -449,7 +449,7 @@ const MarketplaceAccountList = () => {
                         />
                       </div>
                     </div>
-                    <div className="col-md-3">
+                    <div className="col-6 col-sm-3">
                       <div className="form-group">
                         <label>Channel <span className="text-danger">*</span></label>
                         <select
@@ -464,7 +464,7 @@ const MarketplaceAccountList = () => {
                         </select>
                       </div>
                     </div>
-                    <div className="col-md-3">
+                    <div className="col-6 col-sm-3">
                       <div className="form-group">
                         <label>Account Code <span className="text-danger">*</span></label>
                         <input
@@ -495,7 +495,7 @@ const MarketplaceAccountList = () => {
                   {formData.channel === 'amazon' ? (
                     <>
                       <div className="row">
-                        <div className="col-md-6">
+                        <div className="col-12 col-sm-6">
                           <div className="form-group">
                             <label>Client ID</label>
                             <input
@@ -508,7 +508,7 @@ const MarketplaceAccountList = () => {
                             />
                           </div>
                         </div>
-                        <div className="col-md-6">
+                        <div className="col-12 col-sm-6">
                           <div className="form-group">
                             <label>Client Secret</label>
                             <input
@@ -523,7 +523,7 @@ const MarketplaceAccountList = () => {
                         </div>
                       </div>
                       <div className="row">
-                        <div className="col-md-12">
+                        <div className="col-12">
                           <div className="form-group">
                             <label>Refresh Token</label>
                             <textarea
@@ -538,7 +538,7 @@ const MarketplaceAccountList = () => {
                         </div>
                       </div>
                       <div className="row">
-                        <div className="col-md-6">
+                        <div className="col-12 col-sm-6">
                           <div className="form-group">
                             <label>Marketplace ID</label>
                             <input
@@ -551,7 +551,7 @@ const MarketplaceAccountList = () => {
                             />
                           </div>
                         </div>
-                        <div className="col-md-6">
+                        <div className="col-12 col-sm-6">
                           <div className="form-group">
                             <label>Seller ID</label>
                             <input
@@ -569,7 +569,7 @@ const MarketplaceAccountList = () => {
                   ) : (
                     <>
                       <div className="row">
-                        <div className="col-md-6">
+                        <div className="col-12 col-sm-6">
                           <div className="form-group">
                             <label>App ID</label>
                             <input
@@ -582,7 +582,7 @@ const MarketplaceAccountList = () => {
                             />
                           </div>
                         </div>
-                        <div className="col-md-6">
+                        <div className="col-12 col-sm-6">
                           <div className="form-group">
                             <label>Cert ID</label>
                             <input
@@ -597,7 +597,7 @@ const MarketplaceAccountList = () => {
                         </div>
                       </div>
                       <div className="row">
-                        <div className="col-md-12">
+                        <div className="col-12">
                           <div className="form-group">
                             <label>OAuth Refresh Token</label>
                             <textarea
@@ -619,7 +619,7 @@ const MarketplaceAccountList = () => {
                   {/* Settings */}
                   <h6 className="mb-3"><i className="fas fa-cog mr-2"></i>Sync Settings</h6>
                   <div className="row">
-                    <div className="col-md-3">
+                    <div className="col-6 col-sm-3">
                       <div className="form-group">
                         <div className="custom-control custom-switch">
                           <input
@@ -636,7 +636,7 @@ const MarketplaceAccountList = () => {
                         </div>
                       </div>
                     </div>
-                    <div className="col-md-3">
+                    <div className="col-6 col-sm-3">
                       <div className="form-group">
                         <div className="custom-control custom-switch">
                           <input
@@ -653,7 +653,7 @@ const MarketplaceAccountList = () => {
                         </div>
                       </div>
                     </div>
-                    <div className="col-md-3">
+                    <div className="col-6 col-sm-3">
                       <div className="form-group">
                         <label>Default Priority</label>
                         <select
@@ -669,7 +669,7 @@ const MarketplaceAccountList = () => {
                         </select>
                       </div>
                     </div>
-                    <div className="col-md-3">
+                    <div className="col-6 col-sm-3">
                       <div className="form-group">
                         <label>Sync Last N Days</label>
                         <input
@@ -685,7 +685,7 @@ const MarketplaceAccountList = () => {
                     </div>
                   </div>
                 </div>
-                <div className="modal-footer">
+                <div className="modal-footer" style={{ flexWrap: 'wrap', gap: '0.5rem' }}>
                   <button type="button" className="btn btn-secondary" onClick={handleCloseModal}>
                     Cancel
                   </button>

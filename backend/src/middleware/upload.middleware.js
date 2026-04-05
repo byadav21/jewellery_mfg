@@ -52,7 +52,7 @@ const fileFilter = (req, file, cb) => {
   // Allowed file types
   const allowedTypes = {
     cad: ['.stl', '.obj', '.step', '.stp', '.iges', '.igs', '.png', '.jpg', '.jpeg', '.gif', '.webp'],
-    production: ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.mp4', '.mov', '.avi', '.mkv'],
+    production: ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.mp4', '.mov', '.avi', '.mkv', '.pdf', '.stl', '.obj', '.zip', '.rar', '.doc', '.docx', '.xls', '.xlsx'],
     reference: ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.pdf'],
     delivery: ['.png', '.jpg', '.jpeg', '.pdf']
   };

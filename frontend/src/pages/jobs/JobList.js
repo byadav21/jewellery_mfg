@@ -1,8 +1,9 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Link } from 'react-router-dom';
 import { jobAPI } from '../../services/api';
 import { useAuth } from '../../context/AuthContext';
 import DataTable from '../../components/common/DataTable';
+import useDebounce from '../../hooks/useDebounce';
 
 const JobList = () => {
   const [jobs, setJobs] = useState([]);
@@ -11,13 +12,22 @@ const JobList = () => {
   const [filters, setFilters] = useState({ status: '', channel: '', search: '' });
   const { isAdmin } = useAuth();
 
+  // Debounce search input
+  const debouncedSearch = useDebounce(filters.search, 300);
+
+  // Create effective filters with debounced search
+  const effectiveFilters = useMemo(() => ({
+    ...filters,
+    search: debouncedSearch
+  }), [filters.status, filters.channel, debouncedSearch]);
+
   const fetchJobs = useCallback(async () => {
     try {
       setLoading(true);
       const response = await jobAPI.getAll({
         page: pagination.page,
         limit: pagination.limit,
-        ...filters
+        ...effectiveFilters
       });
       const data = response.data.data || response.data;
       const jobsList = data.jobs || data || [];
@@ -31,7 +41,7 @@ const JobList = () => {
     } finally {
       setLoading(false);
     }
-  }, [pagination.page, pagination.limit, filters]);
+  }, [pagination.page, pagination.limit, effectiveFilters]);
 
   useEffect(() => {
     fetchJobs();
@@ -171,7 +181,7 @@ const JobList = () => {
                       type="text"
                       className="form-control"
                       name="search"
-                      placeholder="Job Code or SKU..."
+                      placeholder="Job Code, SKU, Product, Customer..."
                       value={filters.search}
                       onChange={handleFilterChange}
                     />
